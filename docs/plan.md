@@ -395,6 +395,14 @@ the null decoder). No host AAC decoder needed.
     99 instead of 120 fps. So it is a race between the CPU running a frame ahead and the GPU; the lead is the
     write-back of the two capture buffers against the game's read of them. 0.4.1 ships with 0 as the default until
     it is found. `fault-ops.txt` now starts at the oldest submission the GPU had not finished (at most 16 back).
+  - With the validation layer, draws reported set 0 "disturbed by a previous call that set VkPipelineLayout ... which is
+    not compatible", and with `MP4_GPL=0` (validation still on) the run past the door stayed clean. The stage
+    libraries were cached by shader alone, so one built under another layout's set (the boot prebuild's, made from the
+    stage alone, or another pipeline's) was linked into pipelines whose set differs. `PrKey`/`FsKey` now carry the
+    built set's hash (`Layout.set_h`). The white flicker of textures there is gone with it (the user's play, overlap
+    on). The device loss is not: it came again about 900 frames past the door (a write at 0x4fd6000), and the layer
+    still reports the set 0 message in the first area, perhaps its INDEPENDENT_SETS compatibility check (see
+    `vk_exec_draw.c` bind_resources).
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).

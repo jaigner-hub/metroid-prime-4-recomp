@@ -117,6 +117,7 @@ typedef struct Layout {
     int push1;                         // set 1 is a push-descriptor set
     uint32_t n0;                       // independent layouts: b[0..n0) are set 0, the rest set 1
     VkPipelineLayout half[2];          // GPL libraries: {set 0, null}, {null, set 1} (made on first use)
+    uint64_t set_h[2];                 // independent layouts: hash of each set's bindings and push flag (library keys)
     VkDescriptorUpdateTemplate tpl[2]; // per set (make_tpl); VK_NULL_HANDLE: written with write structs
     VkDescriptorSetLayoutBinding b[];
 } Layout;
@@ -1296,6 +1297,8 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     memcpy(l->b, B->b, n * sizeof *B->b);
     l->push = P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
     l->push1 = P.push_stage == GFX_STAGE_FS && F->n && tf <= (int64_t)P.max_push;
+    l->set_h[0] = fnv(fnv(FNV0, l->b, n0 * sizeof *l->b), &l->push, sizeof l->push);
+    l->set_h[1] = fnv(fnv(FNV0, l->b + n0, (n - n0) * sizeof *l->b), &l->push1, sizeof l->push1);
     VkDescriptorSetLayoutCreateInfo s0 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = n0, .pBindings = l->b};
@@ -1696,8 +1699,14 @@ typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t 
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
-typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, xfb; GfxShaderIo fin[32]; } PrKey;
-typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; } FsKey;
+// set_h: Layout.set_h of the set the library is built with. A linked pipeline's libraries must carry its own layout's
+// sets (identically defined, VK_EXT_graphics_pipeline_library); keyed by the shader alone, a library built under one
+// layout (the boot prebuild's, from the stage alone, or another pipeline's) was linked into pipelines whose set differs,
+// and their draws read their descriptors from the wrong slots: past the door out of Sol Valley the validation layer
+// reported set 0 disturbed by an incompatible layout, and a shader's store faulted the device at an address nothing was
+// bound to (issue #7; with MP4_GPL=0, or frames serialised so optimised pipelines replaced the fast links in time, none).
+typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, xfb; GfxShaderIo fin[32]; uint64_t set_h; } PrKey;
+typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; uint64_t set_h; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;
 
@@ -1972,7 +1981,7 @@ static void libs_destroy(void) {
 }
 
 // The four library keys of pipeline s (key k).
-static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, FsKey *fk, FoKey *ok) {
+static void lib_keys(const VkPipeState *s, const GKey *k, const Layout *l, ViKey *v, PrKey *pk, FsKey *fk, FoKey *ok) {
     memset(v, 0, sizeof *v);
     v->kind = LIB_VI, v->topo_class = k->topo_class;
     memcpy(v->attr_fmt, k->attr_fmt, sizeof v->attr_fmt), memcpy(v->attr_off, k->attr_off, sizeof v->attr_off);
@@ -1980,12 +1989,12 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     memset(pk, 0, sizeof *pk);
     GfxShaderIo fin[32];
     pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
-    pk->xfb = k->xfb;
+    pk->xfb = k->xfb, pk->set_h = l->set_h[0];
     pk->missing = vs_union_missing(s, fin);
     for (int i = 0; i < 32; i++)
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
     memset(fk, 0, sizeof *fk);
-    fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
+    fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c, fk->set_h = l->set_h[1];
     memset(ok, 0, sizeof *ok);
     ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
     ok->blend_en = k->blend_en, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
@@ -2006,7 +2015,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
     PrKey pk;
     FsKey fk;
     FoKey ok;
-    lib_keys(s, k, &vk_, &pk, &fk, &ok);
+    lib_keys(s, k, l, &vk_, &pk, &fk, &ok);
     int miss = 0;
     VkPipeline lib[4];
     lib[1] = lib_get(LIB_PR, s, k, l, &pk, sizeof pk, build, &miss);   // shader libraries first: no work when absent
@@ -2478,7 +2487,7 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
     PrKey pk;
     FsKey fk;
     FoKey ok;
-    lib_keys(s, k, &vk_, &pk, &fk, &ok);
+    lib_keys(s, k, l, &vk_, &pk, &fk, &ok);
     U.waits++;
     const void *key[2] = {&pk, &fk};
     uint32_t size[2] = {sizeof pk, sizeof fk};
@@ -2960,15 +2969,14 @@ static void lb_library(const GfxShader *sh, int vertex, int keep) {
         fk.kind = LIB_FS, fk.fs = sh, fk.samples = k.samples;
         key = &fk, size = sizeof fk;
     }
-    uint64_t h = key_hash(key, size);
     Bindings B = {0}, F = {0};
     VkPipelineLayout lay = VK_NULL_HANDLE;
     lb_lock();
+    Layout *l = add_stage(vertex ? &B : &F, sh, 0) ? layout_pair(&B, &F) : NULL;   // the key names its set (PrKey.set_h)
+    if (l) pk.set_h = l->set_h[0], fk.set_h = l->set_h[1];
+    uint64_t h = key_hash(key, size);
     int have = keep && lib_find(h, key, size) != NULL;
-    if (!have && add_stage(vertex ? &B : &F, sh, 0)) {
-        Layout *l = layout_pair(&B, &F);
-        if (l) lay = half_layout(l, vertex ? 0 : 1);
-    }
+    if (!have && l) lay = half_layout(l, vertex ? 0 : 1);
     lb_unlock();
     if (have || !lay) {
         lb_count(stat, have ? 1 : 2, 0);
