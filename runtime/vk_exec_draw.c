@@ -175,14 +175,19 @@ static const RsList *rs_last_l;
 static uint32_t c0_dim[3], c0_binst;     // the dispatch size and base instance of the draw or dispatch being bound
 static uint64_t bind_gen = 1;            // bumped by every bind op that writes ex->prog, ubo, ssbo, tex or img
 
+static int ds_fresh(void) {   // MP4_DS_FRESH=1 (debug, issue #7): no set reused between draws, no pool recycled
+    static int on = -1;
+    if (on < 0) { const char *e = cfg_get("MP4_DS_FRESH"); on = e && *e && strcmp(e, "0"); }
+    return on;
+}
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
     for (int i = 0; i < r->nwritten; i++) vk_guest_written(r->written[i].addr, r->written[i].size);
     for (int i = 0; i < r->npools; i++) {
-        vkResetDescriptorPool(c->device, r->pools[i], 0);
+        if (!ds_fresh()) vkResetDescriptorPool(c->device, r->pools[i], 0);
         AcquireSRWLockExclusive(&spare_lock);
-        int kept = nspare_pool < SPARE_POOLS;
+        int kept = !ds_fresh() && nspare_pool < SPARE_POOLS;
         if (kept) spare_pool[nspare_pool++] = r->pools[i];
         ReleaseSRWLockExclusive(&spare_lock);
         if (!kept) vkDestroyDescriptorPool(c->device, r->pools[i], NULL);
@@ -1901,7 +1906,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         } else {
             VkDescriptorSetLayout sl = s ? info->set_layout1 : info->set_layout;
             VkDescriptorSet set = B.ds_last[s];
-            if (!set || B.ds_last_layout[s] != sl || DS.n[s] != dbytes || memcmp(DS.sig[s], ds, dbytes)) {
+            if (!set || ds_fresh() || B.ds_last_layout[s] != sl || DS.n[s] != dbytes || memcmp(DS.sig[s], ds, dbytes)) {
                 set = alloc_set(ex, sl);
                 write_set(info, s, set, ds, w, i0, i1);
                 B.ds_last[s] = set, B.ds_last_layout[s] = sl, DS.n[s] = dbytes;

@@ -141,6 +141,11 @@ static void dbg_name(VkObjectType t, uint64_t h, const char *fmt, ...) {
                                         .objectHandle = h, .pObjectName = name};
     f(P.device, &ni);
 }
+static int vs_union_off(void) {   // MP4_VS_UNION=0 (debug, issue #7): independent layouts add outputs per pipeline, as shared ones
+    static int off = -1;
+    if (off < 0) { const char *e = cfg_get("MP4_VS_UNION"); off = e && !strcmp(e, "0"); }
+    return off;
+}
 static int gpl_log_on(void) {   // MP4_GPL_LOG=1: every fast link logged (cfg_get: a debug switch without a settings row)
     static int on = -1;
     if (on < 0) { const char *e = cfg_get("MP4_GPL_LOG"); on = e && *e && strcmp(e, "0"); }
@@ -255,10 +260,12 @@ static int ensure_init(void) {
                    "the optimised build replaces it when done"
                  : "vk_pipeline: graphics pipeline library off: draws wait for or skip pipelines that are building");
     const char *ps = cfg_get("MP4_PUSH_STAGE"), *vo = cfg_get("MP4_VS_OUTS");
-    P.push_stage = ps && !strcmp(ps, "fs") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    // MP4_PUSH_STAGE=none (debug, issue #7): neither set pushed, both allocated per draw
+    P.push_stage = ps && !strcmp(ps, "fs") ? GFX_STAGE_FS : ps && !strcmp(ps, "none") ? -1 : GFX_STAGE_VS;
     P.vs_outs_all = vo && !strcmp(vo, "all");
     if (P.indep) rt_log("vk_pipeline: stage-independent layouts: vertex set 0, fragment set 1, %s set pushed; vertex outputs: %s",
-                        P.push_stage == GFX_STAGE_VS ? "vertex" : "fragment", P.vs_outs_all ? "all 32 locations" : "union of paired fragment inputs");
+                        P.push_stage == GFX_STAGE_VS ? "vertex" : P.push_stage == GFX_STAGE_FS ? "fragment" : "no",
+                        P.vs_outs_all ? "all 32 locations" : vs_union_off() ? "this pipeline's fragment inputs (MP4_VS_UNION=0)" : "union of paired fragment inputs");
     // vk_device.c enables every feature the GPU reports in this chain, so the query tells what is enabled.
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT e3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceProvokingVertexFeaturesEXT pvf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
@@ -1575,7 +1582,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
-    if (l->set1) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
+    if (l->set1 && !vs_union_off()) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
         if (missing) {
@@ -1594,7 +1601,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             else if (vout[i].type != fin[i].type)
                 LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
         }
-        if (missing && !l->set1) {
+        if (missing && (!l->set1 || vs_union_off())) {
             uint64_t n2 = 0;
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);

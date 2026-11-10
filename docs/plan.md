@@ -421,6 +421,11 @@ the null decoder). No host AAC decoder needed.
     The layer's "set 0 disturbed" message names the pipeline's own layout on both sides (debug names on layouts and
     pipelines under validation), its INDEPENDENT_SETS check. GPU-assisted validation disabled itself after an
     internal error. `MP4_GPL_LOG=1` logs each fast link with its shaders.
+  - Inside the independent layouts, three more replays lost the device as well: `MP4_PUSH_STAGE=none` (both sets
+    allocated), `MP4_DS_FRESH=1` (no set reused between draws, pools destroyed instead of recycled) and
+    `MP4_VS_UNION=0` (each pipeline's vertex outputs from its own fragment shader, as with shared layouts). Left: what
+    differs in the shaders themselves, the fragment stage moved to set 1 (`spirv_set`) against the shared layout's
+    renumbered bindings (`spirv_rebind`).
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).
