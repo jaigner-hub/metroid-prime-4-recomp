@@ -3318,7 +3318,13 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     // NVN_POLYGON_OFFSET_ENABLE_* bit of the polygon mode in use: point 1, line 2, fill 4
     unsigned mode = pl->mode <= NVN_POLYGON_MODE_FILL ? pl->mode : NVN_POLYGON_MODE_FILL;
     vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0);
-    vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0);
+    static int rt_sink = -1;   // MP4_RT_SINK=1 (debug, issue #7): every draw discards its primitives, so no attachment is written
+    if (rt_sink < 0) {
+        const char *e = cfg_get("MP4_RT_SINK");
+        rt_sink = e && *e && strcmp(e, "0");
+        if (rt_sink) rt_log("vk_pipeline: MP4_RT_SINK=1: every draw discards its primitives");
+    }
+    vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0 || rt_sink);
     vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
     if (P.dyn_vi && s->vs) {
         VtxInput v;

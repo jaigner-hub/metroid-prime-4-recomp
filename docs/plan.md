@@ -433,6 +433,13 @@ the null decoder). No host AAC decoder needed.
     Alt in the log). So the faulting write is no storage store, capture, copy, fill or counter write the replay makes;
     render targets are left. Alt-tab is not it: 0.4.2's defaults played by hand, focus lost and regained 8 times around
     the door, ran clean. The window now logs focus changes and Alt / window-menu messages with the frame.
+  - Still with independent layouts: `MP4_RT_SINK=1` (every draw discards its primitives), `MP4_MEMORY=import` (no
+    mirror syncs or write-backs), `MP4_ASTC=cpu` and `MP4_NO_FREE=1` (no deferred image, view or buffer destroyed, no
+    pool memory freed) lost the device as well, hands off at about frame 10,500 (88 s in, just before the door). The
+    address watch of the earlier run watched another address than the one that faulted, so "never bound" was not shown.
+    No path of the runtime's own is left that the layouts change; next is NVIDIA Nsight Aftermath for the faulting
+    shader and resource. A replay the user alt-tabbed out of lost the device 17 frames after the focus loss: focus
+    changes shift the timing and set the race off sooner; 0.4.2's defaults do not have it.
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).

@@ -342,7 +342,19 @@ static PoolRec *phys_find(const pool_t *key) {
     return NULL;
 }
 
+// MP4_NO_FREE=1 (debug, issue #7): no deferred image, view or buffer is destroyed and no pool's memory freed, a leak
+// that tells a use after free on the GPU from everything else.
+static int no_free(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("MP4_NO_FREE");
+        on = e && *e && strcmp(e, "0");
+        if (on) rt_log("mem: MP4_NO_FREE=1: nothing the GPU may use is destroyed (a leak, for diagnosis)");
+    }
+    return on;
+}
 static void destroy_rec(VkCtx *c, PoolRec *r) {
+    if (no_free()) return;
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     free(r->lsub);
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
@@ -1836,7 +1848,7 @@ static void collect_locked(VkCtx *c) {
     int k = 0;
     for (int i = 0; i < ndead; i++) {
         Dead *d = &dead[i];
-        if (d->seq > done_seq || d->tl > tl) { dead[k++] = *d; continue; }
+        if (d->seq > done_seq || d->tl > tl || no_free()) { dead[k++] = *d; continue; }
         switch (d->kind) {
         case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
         case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
