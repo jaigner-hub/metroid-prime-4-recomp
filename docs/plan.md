@@ -130,7 +130,7 @@ have completed. Hardware's GPU pace gives that; the host's replay, stalled by a 
 five submits ahead (seen in the trace) and the pool ran dry in three of six runs. The window acquire now bounds the
 distance: it waits for the GPU to finish the image's last present (as the display's release implies on hardware) and
 for every submit made before the previous acquire (`MP4_GPU_AHEAD`, then default 1 frame of overlap; 0 serialises the
-frames; the default is 0 since 0.4.1, below). Three scripted runs through the cinematic pass at 59 fps. `nvnSyncWait` logs a blocking wait that times
+frames; 0 was the default in 0.4.1 only, below). Three scripted runs through the cinematic pass at 59 fps. `nvnSyncWait` logs a blocking wait that times
 out and a poll that fails eight times on the same fence, which ruled out a stuck sync first. On the way the game also
 asked for `nvnTextureBuilderGetSparseTileLayout`, answered with Maxwell's 64 KiB tile sizes by bytes per block.
 
@@ -403,6 +403,11 @@ the null decoder). No host AAC decoder needed.
     on). The device loss is not: it came again about 900 frames past the door (a write at 0x4fd6000), and the layer
     still reports the set 0 message in the first area, perhaps its INDEPENDENT_SETS compatibility check (see
     `vk_exec_draw.c` bind_resources).
+  - Without GPL (`MP4_GPL=0`) and the CPU a frame ahead, validation off, 4,600 frames past the door ran clean at 120 fps;
+    with GPL every one of five runs lost the device 40 to 900 frames in. So 0.4.2 turns GPL off by default on every
+    driver (`vk_caps.c` vk_caps_gpl; before, only on AMD's RDNA 1/2 branch, for device losses with fast-linked
+    pipelines in issue #5, likely the same bug) and puts `MP4_GPU_AHEAD` back to 1. What in the fast links makes the
+    store go astray is not found yet.
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).
