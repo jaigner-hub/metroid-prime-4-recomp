@@ -35,7 +35,8 @@ Expect, for now:
 
   and press P while it is on screen: the last 8 frames go to `shots` as PNGs and the next frame's render passes to
   `dump` (about 1 GB, and a short hitch); both paths are relative to the folder the game was started from. The log
-  is `logs\mp4.log` next to the exe.
+  is `logs\mp4.log` next to the exe. The ring copies every frame back from the GPU and lowers the frame rate a lot in
+  heavy areas, so remove the `[capture]` lines again once you have the frames.
 
 This repository contains no game content. You need your own dump of the game (XCI or NSP), its 1.1.0 update NSP, and
 the keys dumped from your own console. The content check (`tools/check_content.py`, run by the pre-commit hook and
