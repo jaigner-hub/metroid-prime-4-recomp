@@ -23,7 +23,7 @@ typedef enum {
     UI_MENU_AFTER_RESTART,    // note on a setting that is read at start
     UI_MENU_SET_BY_ENV,       // note on a setting an environment variable fixes
     UI_MENU_SAVE_FAILED,
-    UI_MENU_VERSION,          // "TotK Recomp %s, game %s": the port version and the game update, beside the title
+    UI_MENU_VERSION,          // the port version and game update beside the title
 
     // Screen
     UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC,
@@ -36,6 +36,7 @@ typedef enum {
     UI_MENU_GRAPHICS,         // group heading over the resolution rows
     UI_MENU_OUTPUT_RES, UI_MENU_OUTPUT_RES_DESC,
     UI_MENU_RENDER_SCALE, UI_MENU_RENDER_SCALE_DESC, UI_MENU_RENDER_SCALE_GAME,
+    UI_MENU_ANISOTROPY, UI_MENU_ANISOTROPY_DESC, UI_MENU_ANISOTROPY_GAME,
     UI_MENU_UPSCALER, UI_MENU_UPSCALER_DESC, UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR,
     UI_MENU_ASPECT, UI_MENU_ASPECT_DESC, UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH,
     UI_MENU_SHARPNESS, UI_MENU_SHARPNESS_DESC,

@@ -538,6 +538,9 @@ static void tab_screen(float scale) {
     opt_group(UI_MENU_GRAPHICS);
     row_output_res();
     row_render_scale();
+    static const char *const af_values[] = {"game", "2", "4", "8", "16"};
+    const char *af_names[] = {menu_text(UI_MENU_ANISOTROPY_GAME), "2×", "4×", "8×", "16×"};
+    opt_choice_list("MP4_ANISOTROPY", UI_MENU_ANISOTROPY, af_values, af_names, 5, UI_MENU_ANISOTROPY_DESC);
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
     opt_choice("MP4_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("MP4_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");

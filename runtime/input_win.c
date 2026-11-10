@@ -684,8 +684,10 @@ static int blocked(volatile LONG *flag, uint64_t buttons) {
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
     int text = blocked(&g_block, *buttons), menu = blocked(&g_menu, *buttons);
-    if (!text && !menu) return;
-    *buttons = 0; *lx = *ly = *rx = *ry = 0;
+    if (text || menu) {
+        *buttons = 0; *lx = *ly = *rx = *ry = 0;
+    }
+    res_scan_input((*buttons >> B_ZL) & 1u);
 }
 
 void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {

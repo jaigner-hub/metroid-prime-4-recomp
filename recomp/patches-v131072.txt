@@ -76,3 +76,32 @@ site realtime main fc5f68 91100129 91002129          # add x9, x9, #0x400 -> #8
 # page +16), which tells this frame from the last at any rate. x9 is written again on both paths before it is read.
 site realtime main 2a2534 900088e9 @page:x9          # adrp x9, 0x13be000 -> adrp x9, page
 site realtime main 2a2538 bd478122 bd401122          # ldr s2, [x9, #0x780] -> [x9, #0x10]
+
+# Native 4K in docked mode. runtime/game_patch_stubs.c fills the shared page before enabling this set.
+set native4k MP4_NATIVE_4K 0
+
+# Initialize the docked scene presets and the smaller auxiliary targets with packed width and height pairs.
+site native4k main da3fd8 d280c809 @page:x9 f9401129     # ldr x9, [x9, #0x20]
+site native4k main da3fe8 f2c07089 d503201f              # height was already loaded
+site native4k main da3fdc d280800a @page:x10 f940154a    # ldr x10, [x10, #0x28]
+site native4k main da3fec f2c0480a d503201f
+
+# Keep the UI and the main viewport at the same size as the render target.
+site native4k main 1a777c d280f009 @page:x9 f9401129
+site native4k main 1a7780 f2c08709 d503201f
+site native4k main a1ce00 d280f009 @page:x9 f9401129
+site native4k main a1ce18 f2c08709 d503201f
+
+# The game uses the nominal scene dimensions as floats when scaling screen effects.
+site native4k main 336b80 52a88c28 @page:x8 b9403508     # ldr w8, [x8, #0x34] (height)
+site native4k main 336b84 52a89909 @page:x9 b9403129     # ldr w9, [x9, #0x30] (width)
+site native4k main 830994 52b89908 @page:x8 b9403908     # ldr w8, [x8, #0x38] (-width)
+site native4k main 83099c 52a89908 @page:x8 b9403108
+site native4k main e7ea3c 52a89908 @page:x8 b9403108
+site native4k main e7ea54 52a88c28 @page:x8 b9403508
+
+# Skip the stock dynamic-resolution setup for the fixed native target.
+site native4k main 12d9e0 d100c3ff d65f03c0              # ret before the stack frame is allocated
+
+# Use one atomic read for both dimensions of the scan effect. The game input path updates this pair when ZL is held.
+site native4k main 33150c 1a9f854a @page:x9 91010129 c8dffd29 d360fd2a 2a0903e9  # add x9, #0x40; ldar x9, [x9]; lsr x10, x9, #32; mov w9, w9

@@ -1272,7 +1272,16 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
             int sid = NVN_HANDLE_SAMP(h);
             int point = img && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(r->type & 0x400) &&
                         vk_exec_view_aspect(img, &v, hv) != VK_IMAGE_ASPECT_STENCIL_BIT;
-            samp = point ? vk_sampler_point_by_id_locked(sid) : vk_sampler_by_id_locked(sid);
+            if (point) {
+                samp = vk_sampler_point_by_id_locked(sid);
+            } else if (view && !ms && !(r->type & 0x400) && img->mirrored && !img->gpu_owned &&
+                       img->aspect == VK_IMAGE_ASPECT_COLOR_BIT && res_view_type(r->type) == VK_IMAGE_VIEW_TYPE_2D &&
+                       img->levels > (hv && v.set_levels ? v.base_level : 0) + 1 &&
+                       !(hv && v.set_levels && v.nlevels == 1) && !format_class(img->format)) {
+                samp = vk_sampler_aniso_by_id_locked(sid);
+            } else {
+                samp = vk_sampler_by_id_locked(sid);
+            }
         }
     }
     if (!view) {

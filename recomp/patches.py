@@ -17,8 +17,8 @@ of the 2 MiB-aligned module slot free); the runtime commits it and owns its cont
 
 The replacement words are lifted at the site's address in place of the original instruction, and the generated C reads
 `if (rt_patch_on[<set>]) { replacement } else { original }`: one byte load and a branch per executed site. Replacement
-words must not branch except a final `bl` (lifted with the site's return address); the original must not be a branch
-other than `bl`. So the function's control flow, labels and jump tables are the original's. The generator writes
+words must not branch except a final `bl` (lifted with the site's return address) or a lone `ret` at function entry.
+The original must not be a branch other than `bl`. The generator writes
 patches.h (set names, switches, the page address) next to layout.h for the runtime.
 
 A `spin` line names a spin wait found by tools/spin_waits.py: a loop with head <head> that only another thread can end,

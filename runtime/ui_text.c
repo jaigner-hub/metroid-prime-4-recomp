@@ -35,7 +35,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
     [UI_MENU_SAVE_FAILED] = "could not save settings",
-    [UI_MENU_VERSION] = "TotK Recomp %s, game %s",
+    [UI_MENU_VERSION] = "MP4 Recomp %s, game %s",
 
     [UI_MENU_FULLSCREEN] = "Fullscreen", [UI_MENU_FULLSCREEN_DESC] = "Fills the screen with the game; F11 toggles it.",
     [UI_MENU_WINDOW_SIZE] = "Window size", [UI_MENU_WINDOW_SIZE_DESC] = "Size of the game window when not fullscreen.",
@@ -53,13 +53,14 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_PERF_LINE_FPS] = "%.0f fps",
     [UI_MENU_GRAPHICS] = "Picture",
     [UI_MENU_OUTPUT_RES] = "Game resolution",
-    [UI_MENU_OUTPUT_RES_DESC] = "The size the game draws its picture and interface in. Above 1920 x 1080 the game needs "
-                                "more video memory and GPU time. A wider size (21:9) widens the camera's view and moves "
-                                "the HUD to the screen's corners.",
+    [UI_MENU_OUTPUT_RES_DESC] = "For native 4K in docked mode, choose 3840 x 2160 and set 3D render scale to 100 %. "
+                                "Other combinations use the game's default resolution.",
     [UI_MENU_RENDER_SCALE] = "3D render scale",
-    [UI_MENU_RENDER_SCALE_DESC] = "Size of the 3D scene relative to the game resolution; the game's FSR scales it to "
-                                  "that size. Above 100 % smooths jagged edges (supersampling) at a high GPU cost.",
+    [UI_MENU_RENDER_SCALE_DESC] = "Choose 100 % with 3840 x 2160 to render the 3D scene at native 4K after restart.",
     [UI_MENU_RENDER_SCALE_GAME] = "Game (83 %)",
+    [UI_MENU_ANISOTROPY] = "Anisotropic filtering",
+    [UI_MENU_ANISOTROPY_DESC] = "Sharpens mipmapped world textures at shallow angles. Game uses the original texture filters.",
+    [UI_MENU_ANISOTROPY_GAME] = "Game",
     [UI_MENU_UPSCALER] = "Scaling to the window",
     [UI_MENU_UPSCALER_DESC] = "How the picture is scaled when the window is larger than the game resolution. FSR keeps "
                               "edges and detail sharper than bilinear.",
@@ -269,7 +270,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_DEFAULT_MARK] = "по умолчанию",
     [UI_MENU_AFTER_RESTART] = "после перезапуска", [UI_MENU_SET_BY_ENV] = "задано переменной окружения",
     [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
-    [UI_MENU_VERSION] = "TotK Recomp %s, игра %s",
+    [UI_MENU_VERSION] = "MP4 Recomp %s, игра %s",
 
     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран; F11 переключает режим.",
     [UI_MENU_WINDOW_SIZE] = "Размер окна", [UI_MENU_WINDOW_SIZE_DESC] = "Размер окна игры вне полноэкранного режима.",
@@ -288,13 +289,14 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_PERF_LINE_FPS] = "%.0f к/с",
     [UI_MENU_GRAPHICS] = "Изображение",
     [UI_MENU_OUTPUT_RES] = "Разрешение игры",
-    [UI_MENU_OUTPUT_RES_DESC] = "Размер, в котором игра рисует картинку и интерфейс. Выше 1920 × 1080 игре нужно больше "
-                                "видеопамяти и времени GPU. Более широкий размер (21:9) расширяет обзор камеры и "
-                                "переносит интерфейс в углы экрана.",
+    [UI_MENU_OUTPUT_RES_DESC] = "Для нативного 4K в режиме док-станции выберите 3840 × 2160 и масштаб 3D-отрисовки 100 %. "
+                                "При других сочетаниях используется стандартное разрешение игры.",
     [UI_MENU_RENDER_SCALE] = "Масштаб 3D-отрисовки",
-    [UI_MENU_RENDER_SCALE_DESC] = "Размер 3D-сцены относительно разрешения игры; FSR игры доводит её до этого размера. "
-                                  "Выше 100 % сглаживает лесенки на краях (суперсэмплинг) ценой большой нагрузки на GPU.",
+    [UI_MENU_RENDER_SCALE_DESC] = "Выберите 100 % при 3840 × 2160, чтобы после перезапуска 3D-сцена рисовалась в нативном 4K.",
     [UI_MENU_RENDER_SCALE_GAME] = "Как в игре (83 %)",
+    [UI_MENU_ANISOTROPY] = "Анизотропная фильтрация",
+    [UI_MENU_ANISOTROPY_DESC] = "Повышает чёткость текстур мира под острым углом. Режим «Как в игре» сохраняет исходную фильтрацию.",
+    [UI_MENU_ANISOTROPY_GAME] = "Как в игре",
     [UI_MENU_UPSCALER] = "Масштабирование под окно",
     [UI_MENU_UPSCALER_DESC] = "Как картинка растягивается, когда окно больше разрешения игры. FSR сохраняет края и "
                               "детали чётче билинейного.",

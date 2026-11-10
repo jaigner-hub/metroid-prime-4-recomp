@@ -79,8 +79,9 @@ typedef struct {
     view_t v;
     tex_t t;
 } TexSlot;
-typedef struct { samp_par p; VkSampler s, sp; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
-                                                                           // its point-sampled form (vk_sampler_point_by_id_locked)
+// Keep the guest, point-sampled and anisotropic variants separate. A slot may be used with different textures.
+typedef struct { samp_par p; VkSampler s, sp, sa; uint8_t used; } SampSlot;
+static float sampler_anisotropy = 1;
 
 static CRITICAL_SECTION tex_lock;
 static INIT_ONCE tex_once = INIT_ONCE_STATIC_INIT;
@@ -1309,6 +1310,8 @@ static void wb_cfg_init(void) {
 
 static void written_locked(Tex *e) {
     make_fresh(e);   // a partial render keeps what the storage held before
+    // A rendered image no longer qualifies for the override. Resolve its cached descriptors again.
+    if (sampler_anisotropy > 1 && e->pub.mirrored && !e->pub.gpu_owned) tex_gen_bump(e->pub.addr);
     e->pub.gpu_owned = 1;
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;
@@ -2067,7 +2070,7 @@ void vk_sampler_register(int id, const samp_par *s) {
         sslots = p, nsslots = n;
     }
     sslots[id].p = *s;
-    sslots[id].s = sslots[id].sp = VK_NULL_HANDLE;
+    sslots[id].s = sslots[id].sp = sslots[id].sa = VK_NULL_HANDLE;
     sslots[id].used = 1;
     samp_gen++;
     unlock();
@@ -2106,6 +2109,35 @@ VkSampler vk_sampler_by_id_locked(int id) {
         v = s->s;
     }
     return v;
+}
+
+void vk_sampler_anisotropy_init(const VkCtx *c) {
+    int level = cfg_int("MP4_ANISOTROPY");
+    sampler_anisotropy = level == 2 || level == 4 || level == 8 || level == 16
+        ? fminf((float)level, c->props.limits.maxSamplerAnisotropy) : 1;
+}
+
+VkSampler vk_sampler_aniso_by_id_locked(int id) {
+    VkCtx *c = vk_ctx();
+    if (!c || id < 0 || id >= nsslots || !sslots[id].used) return VK_NULL_HANDLE;
+    SampSlot *slot = &sslots[id];
+    const samp_par *p = &slot->p;
+    if (sampler_anisotropy <= 1 || sampler_anisotropy <= p->aniso || p->cmp_mode || p->reduction ||
+        p->magf != NVN_MAG_FILTER_LINEAR || p->lod_max <= p->lod_min ||
+        (p->minf != NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST && p->minf != NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR))
+        return vk_sampler_by_id_locked(id);
+    if (!slot->sa) {
+        samp_par params = *p;
+        params.minf = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR;
+        params.aniso = sampler_anisotropy;
+        slot->sa = sampler_for(c, &params);
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            rt_log("vk: anisotropic filtering %.0fx active on mipmapped world textures", sampler_anisotropy);
+        }
+    }
+    return slot->sa;
 }
 
 VkSampler vk_sampler_point_by_id_locked(int id) {

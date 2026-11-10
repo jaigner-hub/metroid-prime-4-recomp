@@ -417,6 +417,8 @@ class Emitter:
                     repl.append(op(i, r.code))
                 elif r.kind == 'bl' and j == len(words) - 1:
                     repl.append(call(r.target, a))
+                elif r.kind == 'ret' and i == 0 and len(words) == 1:
+                    repl.append(f'{spill}return;')
                 else:
                     raise patches.PatchError(f'{a:#x}: replacement word {w:08x} is a {r.kind}')
             orig = op(i, ins.code) if ins.kind == 'op' else call(ins.target, a)

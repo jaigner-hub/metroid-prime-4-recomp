@@ -63,7 +63,7 @@ int sysinfo_text(char *buf, size_t n) {
     Out o = {buf, n, 0};
     buf[0] = 0;
     char s[256];
-    put(&o, "TotK Recomp system info\n");
+    put(&o, "MP4 Recomp system info\n");
     put(&o, "OS: %s\n", plat_os_version(s, sizeof s) ? s : "unknown");
     sysinfo_cpu_name(s, sizeof s);
     put(&o, "CPU: %s, %u logical processors\n", s[0] ? s : "unknown", plat_cpu_count());

@@ -16,10 +16,15 @@
 # fullscreen = 0
 # Window size, WxH.
 # window_size = 1920x1080
+# Native 4K in docked mode requires output_res = 3840x2160 and render_scale = 100, then a restart.
+# output_res = 1920x1080
+# render_scale = game
 # Vulkan present mode: mailbox (the default), fifo (vsync) or immediate.
 # vk_present = mailbox
 # Which GPU, by index in the Vulkan device list (the best one when unset).
 # gpu_index = 0
+# Anisotropic filtering for mipmapped world textures. game keeps the original filters. 2, 4, 8 and 16 apply after restart.
+# anisotropy = game
 
 [language]
 # The game's language, a Switch language code: ja, en-US, en-GB, fr, fr-CA, de, it, es, es-419, zh-Hans, zh-Hant, ko

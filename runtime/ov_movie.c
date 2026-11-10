@@ -183,7 +183,7 @@ void movie_require_codec(int interactive) {
                     L"unpack the .bz2 file (with 7-Zip, for example; renaming it is not enough) and put "
                     OPENH264_DLL L" next to mp4.exe.\n\n"
                     L"OpenH264 Video Codec provided by Cisco Systems, Inc.",
-                    L"Metroid Prime 4 Recomp", MB_OK | MB_ICONERROR);
+                    L"MP4 Recomp", MB_OK | MB_ICONERROR);
     rt_fatal("movie: openh264 (%ls) is needed for the game's cinematics: run the setup again on this folder, or "
              "unpack %ls next to mp4.exe", OPENH264_DLL, OPENH264_URL);
 }
