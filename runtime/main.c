@@ -451,8 +451,9 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     if (c) {
         for (int i = 0; i < 31; i++)
             rt_logf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
-        rt_logf("  sp  %016llx\n  pc  %016llx  lr %s\n", (unsigned long long)c->sp, (unsigned long long)c->pc,
-                ldr_describe(c->x[30], d, sizeof d));
+        const char *hn = hostfn_name(c->pc);   // a host function the guest called: its name (the lifted function above is then the nearest symbol only)
+        rt_logf("  sp  %016llx\n  pc  %016llx%s%s  lr %s\n", (unsigned long long)c->sp, (unsigned long long)c->pc, hn ? " = " : "",
+                hn ? hn : "", ldr_describe(c->x[30], d, sizeof d));
         uint64_t fp = c->x[29];
         for (int n = 0; n < 32 && fp && !(fp & 7) && readable(fp, 16); n++) {
             uint64_t next = LD64(fp), lr = LD64(fp + 8);

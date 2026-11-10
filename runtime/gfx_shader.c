@@ -89,6 +89,8 @@ struct GfxShader {
     uint32_t in_mask, out_mask;                            // user Locations of Input / Output variables
     GfxShaderIo in[32], out[32];
     uint32_t local[3];
+    volatile LONG xfb_state;                               // gfx_shader_xfb_layout: 0 not read, 1 none, 2 xfb holds it
+    GfxXfbLayout xfb;
 };
 
 static SRWLOCK cache_lock = SRWLOCK_INIT;                  // memory cache
@@ -1651,6 +1653,61 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
 }
 
 int gfx_shader_stage(const GfxShader *s) { return s->stage; }
+
+// The transform feedback layout in a vertex program's control section. Found on Metroid Prime 4's first capture into
+// two buffers (program 139 at the door out of Sol Valley, issue #7): only that program has these fields set; the
+// single-buffer capture programs carry none, and the replay infers theirs (vk_pipeline.c spirv_add_xfb). Per buffer b:
+// the stride as a u16 at 0x6dc + 2b, the output count as a byte at 0x6e8 + b, and per output a byte at 0xdc + 0x80b + i
+// (0x20 + Location, the attribute index of the output's x) and its component count at 0x4dc + 0x80b + i. There:
+// strides 84 and 64, buffer 0 locations 0-5 with 1, 4, 4, 4, 4, 4 components, buffer 1 locations 6-9 with 4 each.
+// The bytes at 0x6ec (02 01 there) are not read. A layout whose component counts do not add up to its stride is
+// refused.
+static int xfb_from_control(const uint8_t *c, GfxXfbLayout *o) {
+    memset(o, 0, sizeof *o);
+    int any = 0;
+    for (int b = 0; b < 4; b++) {
+        uint16_t stride;
+        memcpy(&stride, c + 0x6dc + 2 * b, 2);
+        uint8_t n = c[0x6e8 + b];
+        if (!stride && !n) continue;
+        if (!stride || !n || n > 32) return 0;
+        uint32_t sum = 0;
+        for (int i = 0; i < n; i++) {
+            uint8_t a = c[0xdc + 0x80 * b + i], k = c[0x4dc + 0x80 * b + i];
+            if (a < 0x20 || a >= 0x40 || !k || k > 4) return 0;
+            o->loc[b][i] = (uint8_t)(a - 0x20), o->comps[b][i] = k, sum += k * 4u;
+        }
+        if (sum != stride) return 0;
+        o->stride[b] = stride, o->n[b] = n, any = 1;
+    }
+    return any;
+}
+
+// Read from the shader's stored inputs (<cache>/in), once per shader: a capture pipeline is built for few shaders.
+int gfx_shader_xfb_layout(const GfxShader *s, GfxXfbLayout *o) {
+    GfxShader *m = (GfxShader *)s;
+    if (!m || m->stage != GFX_STAGE_VS) return 0;
+    LONG st = m->xfb_state;
+    if (!st) {
+        Inputs in;
+        GfxXfbLayout l;
+        int loaded = in_load(m->iid, &in), ok = loaded && xfb_from_control(in.control, &l);
+        if (loaded) free(in.buf);
+        if (ok) m->xfb = l;
+        MemoryBarrier();
+        InterlockedCompareExchange(&m->xfb_state, ok ? 2 : 1, 0);
+        st = m->xfb_state;
+        if (ok) {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 8)
+                rt_log("gfx_shader: transform feedback layout from the control section: strides %u %u %u %u", l.stride[0], l.stride[1],
+                       l.stride[2], l.stride[3]);
+        }
+    }
+    if (st != 2) return 0;
+    *o = m->xfb;
+    return 1;
+}
 
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res) {
     if (kind < 0 || kind >= GFX_RES_KINDS) return 0;

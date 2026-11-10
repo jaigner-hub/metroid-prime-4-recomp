@@ -873,8 +873,10 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
     st->pNext = rq;
 }
 
-// Adds a transform feedback layout to a vertex module. NVN programs capture through GLSL xfb qualifiers whose layout
-// the control section does not carry (nvn_api_cmd.c xfb_note), so the layout is taken from the module itself: every
+// Adds a transform feedback layout to a vertex module. A program whose control section carries its layout (L, from
+// gfx_shader_xfb_layout: the first capture into two buffers, issue #7) gets exactly that: per buffer the listed
+// Locations in its order, each with its component count from x, at the program's stride. The single-buffer capture
+// programs carry no layout (nvn_api_cmd.c xfb_note), so for them (L NULL) it is taken from the module itself: every
 // Output variable with a Location, in location order, packed from offset 0 of buffer 0. Built-ins (gl_Position) are
 // left out: this game's capture shaders write (0, 0, 0, 1) there and the transformed vertex to location 0. The
 // translator declares every output a vec4 and opens the shader by storing (0, 0, 0, 1) to each; the components the
@@ -882,7 +884,7 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
 // the variable is retyped to that width and the prologue stores to the rest are dropped (the SPH output map, which
 // would say the same, is not read). Adds the TransformFeedback capability, the Xfb execution mode and the XfbBuffer,
 // XfbStride and Offset decorations. NULL when the module has no located output or an output is read back.
-static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n, const GfxXfbLayout *L) {
     enum { OP_CAPABILITY = 17, OP_EXECUTION_MODE = 16, OP_ACCESS_CHAIN = 65, OP_LOAD = 61, OP_STORE = 62, OP_LABEL = 248,
            CAP_XFB = 53, MODE_XFB = 11, DEC_OFFSET = 35, DEC_XFB_BUFFER = 36, DEC_XFB_STRIDE = 37, MAXV = 64 };
     uint64_t cap_end = 0, ep_end = 0, ann_end = 0, fn_at = 0;
@@ -920,9 +922,28 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     if (!cap_end || !ep_id || !f32 || ep_end < cap_end || ann_end < ep_end || !fn_at) return NULL;
     // The captured outputs: located variables, and the components stored after the prologue (a store of a constant
     // 0 or 1 before any other store counts as the prologue)
-    struct { uint32_t id, loc, var, comps, off, newtype, narrow, vt, varlen, varw[6]; } cap[MAXV];
+    struct { uint32_t id, loc, var, comps, off, newtype, narrow, vt, varlen, varw[6], buf; } cap[MAXV];
     int ncap = 0;
-    for (int v = 0; v < nvar; v++) {
+    uint32_t want[MAXV];   // with L: the component count L gives each capture
+    for (int b = 0; L && b < 4; b++)
+        for (int e = 0; e < L->n[b]; e++) {
+            int v = 0, l = 0;
+            for (; v < nvar; v++) {
+                for (l = 0; l < nloc && locs[l].id != vars[v].id; l++) {}
+                if (l < nloc && locs[l].loc == L->loc[b][e]) break;
+            }
+            if (v == nvar || ncap == MAXV) return NULL;   // the layout names an output the module does not have
+            uint32_t declared = 1;
+            for (int k = 0; k < nptr; k++)
+                if (ptr[k].id == vars[v].type)
+                    for (int j = 0; j < nvec; j++)
+                        if (vec[j].id == ptr[k].type) declared = vec[j].count;
+            if (L->comps[b][e] > declared) return NULL;
+            int c = ncap++;
+            cap[c].id = vars[v].id, cap[c].loc = L->loc[b][e], cap[c].var = (uint32_t)v, cap[c].comps = declared, cap[c].newtype = 0;
+            cap[c].narrow = 0, cap[c].vt = 0, cap[c].buf = (uint32_t)b, want[c] = L->comps[b][e];
+        }
+    for (int v = 0; v < nvar && !L; v++) {
         int l = 0;
         while (l < nloc && locs[l].id != vars[v].id) l++;
         if (l == nloc) continue;
@@ -934,6 +955,7 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         int at = ncap++;
         while (at > 0 && cap[at - 1].loc > locs[l].loc) cap[at] = cap[at - 1], at--;
         cap[at].id = vars[v].id, cap[at].loc = locs[l].loc, cap[at].var = (uint32_t)v, cap[at].comps = declared, cap[at].newtype = 0, cap[at].narrow = 0, cap[at].vt = 0;
+        cap[at].buf = 0;
     }
     if (!ncap) return NULL;
     // Stores per captured variable: component access chains and what is stored through them
@@ -967,9 +989,9 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         }
         i += len;
     }
-    uint32_t stride = 0, added = 0;
+    uint32_t stride = 0, added = 0, bstride[4] = {0};
     for (int c = 0; c < ncap; c++) {
-        uint32_t m = written[c], comps = m ? 32 - (uint32_t)__builtin_clz(m) : cap[c].comps;   // highest written + 1
+        uint32_t m = written[c], comps = L ? want[c] : m ? 32 - (uint32_t)__builtin_clz(m) : cap[c].comps;   // highest written + 1
         if (comps < cap[c].comps) {   // narrow the variable: a vector type of that width and an Output pointer to it
             // The narrowed variable is declared again where the functions start, after every type: an existing
             // float vector type and Output pointer are reused there (declaring a second vec3 is invalid SPIR-V, and
@@ -983,8 +1005,9 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
             added += (vt ? 0 : 4) + (pt ? 0 : 4);
             cap[c].comps = comps;
         }
-        cap[c].off = stride, stride += cap[c].comps * 4;
+        cap[c].off = bstride[cap[c].buf], bstride[cap[c].buf] += cap[c].comps * 4;
     }
+    stride = bstride[0];
     uint64_t total = n + 2 + 3 + (uint64_t)ncap * 12 + added;
     uint32_t *o = malloc(total * 4), *p = o;
     if (!o) return NULL;
@@ -999,8 +1022,8 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         if (i == ep_end) *p++ = 3u << 16 | OP_EXECUTION_MODE, *p++ = ep_id, *p++ = MODE_XFB;
         if (i == ann_end)
             for (int c = 0; c < ncap; c++) {
-                *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = cap[c].id, *p++ = DEC_XFB_BUFFER, *p++ = 0;
-                *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = cap[c].id, *p++ = DEC_XFB_STRIDE, *p++ = stride;
+                *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = cap[c].id, *p++ = DEC_XFB_BUFFER, *p++ = cap[c].buf;
+                *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = cap[c].id, *p++ = DEC_XFB_STRIDE, *p++ = bstride[cap[c].buf];
                 *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = cap[c].id, *p++ = DEC_OFFSET, *p++ = cap[c].off;
             }
         if (i == fn_at)
@@ -1047,12 +1070,14 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     *out_n = (uint64_t)(p - o);
     static int said;
     extern int vk_dump_armed;   // vk_dump.c: a dump frame logs every layout (MP4_DUMP_XFB_PROBE reads them)
-    if (said++ < 4 || vk_dump_armed) {
-        char desc[160] = "";
+    if (said++ < 4 || vk_dump_armed || cfg_bool("MP4_XFB_LOG")) {   // MP4_XFB_LOG: every layout
+        char desc[320] = "";
         size_t dn = 0;
         for (int c = 0; c < ncap && dn < sizeof desc - 20; c++)
-            dn += (size_t)snprintf(desc + dn, sizeof desc - dn, " %u:vec%u@%u", cap[c].loc, cap[c].comps, cap[c].off);
-        rt_log("vk_pipeline: transform feedback layout: %d outputs, stride %u:%s", ncap, stride, desc);
+            dn += (size_t)snprintf(desc + dn, sizeof desc - dn, cap[c].buf ? " %u:vec%u@b%u+%u" : " %u:vec%u@%u", cap[c].loc, cap[c].comps,
+                                   cap[c].buf ? cap[c].buf : cap[c].off, cap[c].off);
+        rt_log("vk_pipeline: transform feedback layout%s: %d outputs, stride %u%s%.0u:%s", L ? " (control section)" : "", ncap, stride,
+               bstride[1] ? ", buffer 1 stride " : "", bstride[1], desc);
     }
     return o;
 }
@@ -1552,7 +1577,8 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     uint32_t *xpatched = NULL;
     if (s->xfb) {   // a capture draw: the vertex shader carries the transform feedback layout
         uint64_t n2 = 0;
-        if ((xpatched = spirv_add_xfb(vcode, vw, &n2))) vcode = xpatched, vw = n2;
+        GfxXfbLayout xl;
+        if ((xpatched = spirv_add_xfb(vcode, vw, &n2, gfx_shader_xfb_layout(s->vs, &xl) ? &xl : NULL))) vcode = xpatched, vw = n2;
         else LOG_ONCE("vk_pipeline: cannot add the transform feedback layout to the vertex shader");
         extern int vk_dump_armed;
         if (xpatched && vk_dump_armed) {   // MP4_DUMP_XFB_PROBE: the patched module, for spirv-val
@@ -1751,7 +1777,8 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
         uint32_t *xp = NULL;
-        if (pk->xfb && (xp = spirv_add_xfb(vcode, vw, &n2))) {
+        GfxXfbLayout xl;
+        if (pk->xfb && (xp = spirv_add_xfb(vcode, vw, &n2, gfx_shader_xfb_layout(pk->vs, &xl) ? &xl : NULL))) {
             vcode = xp, vw = n2;
             extern int vk_dump_armed;
             if (vk_dump_armed) {   // MP4_DUMP_XFB_PROBE: the patched module, for spirv-val

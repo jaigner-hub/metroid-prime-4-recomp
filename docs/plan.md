@@ -362,6 +362,21 @@ the null decoder). No host AAC decoder needed.
   ten frames and are sharp again by frame 2504 (screenshots of both runs at the burst and after it). The save-load
   frame (frame ~2216) still waits 130 ms on a fence whose batch took 7 ms of GPU time: that is the load's residency
   cost above, not the decode. The validation layer reports nothing new (the two VUIDs it lists predate this).
+- The crash leaving Sol Valley (issue #7, 2026-11-10), reproduced on a reporter's save (about a minute from the load
+  to the door). As the game leaves the area it finalizes six virtual pools, and the next `nvnQueueSubmitCommands`
+  uploads a texture over one of them from its storage: the shadow had been freed with the pool, and `tex_bl_copy`
+  faulted reading its first page (`0x15c0000000`). On the console that read meets unmapped GPU memory. A finalized
+  pool's shadow is now reset to zero pages and kept for the next virtual pool that fits (`memory.c`
+  `mem_shadow_release`), and `vk_texture.c` `storage_texels` logs an uncommitted storage instead of copying it.
+  Crash reports now name the host function the guest called (`main.c`), and `MP4_HOSTFN_LIST=1` lists them.
+- The same spot has the first transform feedback capture into two buffers (program 139, a vertex-only program; 432 x
+  432 points into 84- and 64-byte records). Unlike the single-buffer programs, its control section carries the layout:
+  per buffer b a u16 stride at 0x6dc + 2b, an output count at 0x6e8 + b, and per output the attribute index
+  (0x20 + Location) at 0xdc + 0x80b + i and its component count at 0x4dc + 0x80b + i (buffer 0 locations 0-5 with
+  1, 4, 4, 4, 4, 4 components, buffer 1 locations 6-9). `gfx_shader.c` `gfx_shader_xfb_layout` reads it from the
+  shader's stored inputs and `spirv_add_xfb` follows it; the earlier inference packed all ten outputs into buffer 0.
+  `MP4_DUMP=xfb2` dumps the frame of the first capture into more than one buffer, and a dump writes each program's
+  control sections (`prog_<serial>_<stage>.ctl`). Not yet checked: that the area past the door draws right from them.
 
 ## Shared core
 

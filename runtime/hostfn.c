@@ -164,6 +164,9 @@ void hostfn_seal(void) {
     if (sealed) return;
     rt_register_host(RT_RET_HOST, return_sentinel);
     sealed = 1;
+    const char *list = getenv("MP4_HOSTFN_LIST");   // MP4_HOSTFN_LIST=1: every host function and its synthetic address
+    if (list && *list == '1')
+        for (int i = 0; i < nslots; i++) rt_log("hostfn: %#llx %s", (unsigned long long)slot_addr(i), slots[i].name);
     int n = rt_linked_modules(mods, 16);
     rt_dispatch_init(mods, n);
 }

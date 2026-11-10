@@ -51,7 +51,9 @@ static char dir[400];
 static FILE *passes_f, *images_f;
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
 static int skip_runs, dump_ubo;        // MP4_DUMP_SKIP_RUNS, MP4_DUMP_UBO (vec4 printed per block, 40 for =1)
-static int arm_on_xfb;                 // MP4_DUMP=xfb: the dump frame is the one whose replay meets the first transform feedback begin
+static int arm_on_xfb;                 // MP4_DUMP=xfb: the dump frame is the one whose replay meets the first transform feedback begin;
+                                       // MP4_DUMP=xfb2 (2): the first begin with a buffer bound past index 0
+static int xfb_multi;                  // a buffer past index 0 is bound since the last begin (MP4_DUMP=xfb2)
 static int arm_on_call;                // MP4_DUMP=when: the dump frame is set by vk_dump_arm (boot.c ring_shot, MP4_DUMP_WHEN)
 static int draws_pass = -1, in_draw_copy;   // MP4_DUMP_DRAWS=<pass>: colour target 0 copied after every draw of that pass
 static int dump_vb;
@@ -813,6 +815,13 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
         ents_over++;
         goto out;
     }
+    if (ex->prog)   // each stage's control section, as prog_<serial>_<stage>.ctl: the program state the replay reads
+        for (uint32_t i = 0; i < ex->prog->nstage && i < 6; i++) {
+            char cp[600];
+            snprintf(cp, sizeof cp, "%s/prog_%llu_%u.ctl", vk_dump_dir(), (unsigned long long)ex->prog->serial, i);
+            FILE *f = ex->prog->sd[i].control ? fopen(cp, "wb") : NULL;
+            if (f) fwrite(ex->prog->sd[i].control, 1, 0x880, f), fclose(f);
+        }
     Str b = {0};
     sp(&b, "vs %016llx fs %016llx prog %llu (vs of %llu, fs of %llu, bind stages %#x) prim %d%s\n", (unsigned long long)shader_hash(s->vs),
        (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0),
@@ -1051,10 +1060,12 @@ static void region_desc(const NVNcopyRegion *r, char *buf, size_t n) {
 void vk_dump_xfb(VkExec *ex, uint32_t op, const void *payload) {
     (void)ex;
     AcquireSRWLockExclusive(&rec_lock);
-    if (arm_on_xfb && op == OP_XFB_BEGIN && dump_frame == UINT64_MAX) {   // MP4_DUMP=xfb: this frame, from here on
+    if (op == OP_XFB_BIND && ((const p_xfb_bind *)payload)->index > 0) xfb_multi = ((const p_xfb_bind *)payload)->size != 0 || xfb_multi;
+    if (arm_on_xfb && op == OP_XFB_BEGIN && dump_frame == UINT64_MAX && (arm_on_xfb == 1 || xfb_multi)) {   // MP4_DUMP=xfb: this frame, from here on
         dump_frame = frame_now();
         rt_log("vk_dump: transform feedback begin: dumping frame %llu from here", (unsigned long long)dump_frame);
     }
+    if (op == OP_XFB_BEGIN) xfb_multi = 0;
     if (!active()) goto out;
     if (op == OP_XFB_BIND) {
         const p_xfb_bind *b = payload;
@@ -1122,7 +1133,7 @@ static void make_dirs(char *path) {
 
 void vk_dump_init(void) {
     const char *e = cfg_get("MP4_DUMP");
-    if (e && !strcmp(e, "xfb")) arm_on_xfb = 1, dump_frame = UINT64_MAX;
+    if (e && (!strcmp(e, "xfb") || !strcmp(e, "xfb2"))) arm_on_xfb = e[3] ? 2 : 1, dump_frame = UINT64_MAX;
     else if (e && !strcmp(e, "when")) arm_on_call = 1, dump_frame = UINT64_MAX;
     else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("MP4_DUMP_LOG");

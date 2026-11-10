@@ -77,6 +77,11 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorde
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
 const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
+// A vertex program's transform feedback layout as its control section carries it (gfx_shader.c xfb_from_control):
+// per buffer its stride and the captured outputs in buffer order, each a Location and a component count from x.
+typedef struct { uint16_t stride[4]; uint8_t n[4], loc[4][32], comps[4][32]; } GfxXfbLayout;
+// 1 and *o filled when the shader's stored inputs give a layout, 0 when they give none (the replay then infers it).
+int gfx_shader_xfb_layout(const GfxShader *s, GfxXfbLayout *o);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };

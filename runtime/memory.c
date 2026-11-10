@@ -53,6 +53,7 @@ static RtGuestLayout L;
 static uint64_t mods_lo, mods_hi;   // fixed module window
 static uint64_t shadow_next, shadow_end;   // virtual pool shadow reservations (mem_shadow_reserve): next candidate, limit
 static uint64_t shadow_lo[64], shadow_hi[64];   // the reservations made, for watched()
+static uint8_t shadow_free[64];               // released by nvnMemoryPoolFinalize, kept for the next pool that fits
 static int nshadow;
 static SRWLOCK lock = SRWLOCK_INIT;
 static uint64_t heap_size, alias_bytes;
@@ -314,12 +315,28 @@ const RtGuestLayout *mem_layout(void) { return &L; }
 // so each was uploaded again, whole, at every use (5 x 207 MiB a frame, about 5 fps, after the first boss).
 uint64_t mem_shadow_reserve(uint64_t size) {
     size = align_up(size, FRZ_SIZE);
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < nshadow; i++)   // a released reservation that holds the pool (smallest first fit)
+        if (shadow_free[i] && shadow_hi[i] - shadow_lo[i] >= size) {
+            int best = i;
+            for (int j = i + 1; j < nshadow; j++)
+                if (shadow_free[j] && shadow_hi[j] - shadow_lo[j] >= size && shadow_hi[j] - shadow_lo[j] < shadow_hi[best] - shadow_lo[best])
+                    best = j;
+            shadow_free[best] = 0;
+            ReleaseSRWLockExclusive(&lock);
+            rt_log("memory: virtual pool shadow %#llx+%#llx (reused)", (unsigned long long)shadow_lo[best], (unsigned long long)size);
+            return shadow_lo[best];
+        }
+    ReleaseSRWLockExclusive(&lock);
     for (uint64_t at = shadow_next; at + size <= shadow_end; at += GiB)
         if (reserve_at(at, size, MEM_WRITE_WATCH)) {
             shadow_next = align_up(at + size, GiB);
             if (!VirtualAlloc((void *)(uintptr_t)at, size, MEM_COMMIT, PAGE_READWRITE))
                 rt_fatal("memory: cannot commit %#llx bytes of virtual pool shadow", (unsigned long long)size);
-            if (nshadow < 64) shadow_lo[nshadow] = at, shadow_hi[nshadow] = at + size, nshadow++;
+            AcquireSRWLockExclusive(&lock);
+            if (nshadow < 64) shadow_lo[nshadow] = at, shadow_hi[nshadow] = at + size, shadow_free[nshadow] = 0, nshadow++;
+            ReleaseSRWLockExclusive(&lock);
+            rt_log("memory: virtual pool shadow %#llx+%#llx", (unsigned long long)at, (unsigned long long)size);
             return at;
         }
     return 0;
@@ -327,7 +344,27 @@ uint64_t mem_shadow_reserve(uint64_t size) {
 int mem_shadow_commit(uint64_t addr, uint64_t size) {
     return VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
 }
-void mem_shadow_release(uint64_t addr) { VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE); }
+// A finalized pool's shadow is not given back: textures over it can outlive the pool in the host's tables, and the
+// first upload of one after the pool is gone read freed pages (nvnQueueSubmitCommands faulting in tex_bl_copy on the
+// way out of Sol Valley, issue #7; on the console that read meets unmapped GPU memory, not a fault). Its pages go back
+// to zero pages (no memory until touched) and the reservation is kept for the next virtual pool that fits, which keeps
+// the address space bounded. A reservation past the 64 tracked is freed as before.
+void mem_shadow_release(uint64_t addr) {
+    AcquireSRWLockExclusive(&lock);
+    int i = 0;
+    while (i < nshadow && shadow_lo[i] != addr) i++;
+    if (i < nshadow) {
+        uint64_t size = shadow_hi[i] - shadow_lo[i];
+        if (!VirtualFree((void *)(uintptr_t)addr, size, MEM_DECOMMIT) ||
+            !VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, PAGE_READWRITE))
+            rt_fatal("memory: cannot reset virtual pool shadow %#llx+%#llx", (unsigned long long)addr, (unsigned long long)size);
+        ResetWriteWatch((void *)(uintptr_t)addr, size);
+        shadow_free[i] = 1;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    rt_log("memory: virtual pool shadow %#llx released%s", (unsigned long long)addr, i < nshadow ? " (kept as zero pages)" : "");
+    if (i == nshadow) VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE);
+}
 // 1 when [addr, addr+size) lies in one shadow reservation: committed as zero pages, so a page nothing wrote (no write
 // generation, vk_memory.c) holds zeros (vk_texture.c upload_part).
 // The committed guest heap [lo, hi); 0 before SetHeapSize. vk_memory.c arena_get imports chunks of it.

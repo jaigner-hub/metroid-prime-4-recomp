@@ -1600,6 +1600,18 @@ static int region_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
 // linear copy of the whole level; for a small region of a large texture that cost tens of milliseconds while the guest
 // thread held its virtual core and the caller the texture lock (monsters2 replay, frames 765-790).
 static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
+    // Storage that is not committed (a virtual pool's shadow released at nvnMemoryPoolFinalize, issue #7): logged with
+    // the texture and its pool, and not copied, instead of faulting in tex_bl_copy.
+    MEMORY_BASIC_INFORMATION mi;
+    if (!VirtualQuery(t->mem, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+        (const uint8_t *)mi.BaseAddress + mi.RegionSize < t->mem + (t->L.size < 4096 ? t->L.size : 4096)) {
+        static volatile long n_gone;
+        log_limited(&n_gone, "%sTexels: storage %p of texture serial %llu (%ux%ux%u format %#x, %#llx bytes) is not committed (state %#lx); pool %p mem %p size %#llx magic %#x",
+                    write ? "Write" : "Read", (void *)t->mem, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,
+                    (unsigned long long)t->L.size, (unsigned long)mi.State, (void *)t->pool, t->pool ? (void *)t->pool->mem : NULL,
+                    t->pool ? (unsigned long long)t->pool->size : 0ull, t->pool ? t->pool->magic : 0u);
+        return 0;
+    }
     for (int z = 0; z < g->nz; z++) {
         unsigned layer = g->is3d ? 0 : g->layer0 + (unsigned)r->zoffset + (unsigned)z;
         uint32_t slice = g->is3d ? (uint32_t)(r->zoffset + z) : 0;
