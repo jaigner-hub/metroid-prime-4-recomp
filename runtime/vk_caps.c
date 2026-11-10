@@ -48,18 +48,18 @@ void vk_caps_driver(VkPhysicalDevice p) {
     vk_caps.amd_sc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && strstr(drv.driverInfo, "shader compiler");
 }
 
-// MP4_GPL=0/1 forces graphics pipeline libraries off or on. Default off on every driver since 0.4.2: past the door out
-// of Sol Valley (issue #7, NVIDIA) five runs with GPL and the CPU a frame ahead lost the device 40 to 900 frames in,
-// a shader store at an address nothing was bound to, and two runs without GPL ran clean at 120 fps; the cause in the
-// fast links is not found yet (docs/plan.md). Before that it was off on AMD's RDNA 1/2 driver branch only: every boot
+// MP4_GPL=0/1 forces graphics pipeline libraries off or on. Default off on AMD's RDNA 1/2 driver branch: every boot
 // that lost the device there had a cold pipeline cache and draws waiting on fast-linked pipelines, and a run with GPL
 // off booted (issue #5); Savage Wind Recomp turns GPL off on RDNA 4 under RADV for a GPU hang at the title screen.
+// 0.4.2 turned it off everywhere for the device loss past Sol Valley (issue #7), which came from the stage-independent
+// layouts GPL needs: a pipeline without a fragment shader had its vertex set never bound (vk_exec_draw.c
+// bind_resources). Fixed in 0.4.3, so the default is as before; issue #5 may have been the same bug, untested there.
 int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
                 const VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT *p) {
     gpl_lib = f->graphicsPipelineLibrary;
     gpl_fast = p->graphicsPipelineLibraryFastLinking;
     const char *e = cfg_get("MP4_GPL");   // no fixed default: it depends on the driver, see above
-    vk_caps.gpl = gpl_lib && gpl_fast && (e && *e ? strcmp(e, "0") != 0 : 0);
+    vk_caps.gpl = gpl_lib && gpl_fast && (e && *e ? strcmp(e, "0") != 0 : !vk_caps.amd_sc);
     return vk_caps.gpl;
 }
 
@@ -139,7 +139,7 @@ void vk_caps_init(VkCtx *c) {
     const char *ge = cfg_get("MP4_GPL");
     rt_log("vk caps: gpl %s fast-link %s (graphicsPipelineLibrary %u%s)", vk_caps.gpl ? "yes" : "no",
            gpl_fast ? "yes" : "no", (unsigned)gpl_lib,
-           !gpl_lib || !gpl_fast || vk_caps.gpl ? "" : ge && *ge ? ", off by MP4_GPL=0" : ", off by default (MP4_GPL=1 turns it on)");
+           !gpl_lib || !gpl_fast || vk_caps.gpl ? "" : ge && *ge ? ", off by MP4_GPL=0" : ", off on AMD's RDNA 1/2 driver");
     rt_log("vk caps: fallbacks: float64 %s, storage buffers %s %u, subgroup pin %u on stages %#x, translator subgroup vs/fs/cs %u/%u/%u",
            vk_caps.float64 ? "native" : "softfloat64", vk_caps.sbuf_align ? "rounded down to" : "exact, alignment",
            (unsigned)l->minStorageBufferOffsetAlignment, want, (unsigned)vk_caps.sg_pin_stages, told[0], told[1], told[2]);

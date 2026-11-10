@@ -1870,6 +1870,15 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         nd += cnt;
     }
+    // A pipeline without fragment bindings (no fragment shader: depth and shadow passes, captures) has an empty set 1
+    // that the loop above never reaches, so d0[1] stayed 0, set 0's size came out 0 and set 0 was neither pushed nor
+    // bound. Such a draw read whatever set 0 the draw before left, under another layout, and its shaders fetched
+    // through stale descriptors: GPU page faults at addresses no resource held (Nsight Aftermath: a shader-core read
+    // that failed to translate, issue #7), sooner with the CPU a frame ahead, since the stale descriptor memory is
+    // recycled per frame.
+    static int set0_bug = -1;   // MP4_DEBUG_SET0_BUG=1: the old behaviour, to make a device loss on purpose (crash reports)
+    if (set0_bug < 0) { const char *e = cfg_get("MP4_DEBUG_SET0_BUG"); set0_bug = e && *e && strcmp(e, "0"); }
+    if (n_sets == 2 && lo[1] >= info->n_bindings && !set0_bug) d0[1] = nd;
     // Storage images the shaders store into: a render into them for the texture bookkeeping (vk_texture_gpu_written_id),
     // so a mirrored one is not uploaded from its storage over the stores and its storage gets the result back.
     for (int k = 0; k < nstored; k++) vk_texture_gpu_written_id(stored[k]);

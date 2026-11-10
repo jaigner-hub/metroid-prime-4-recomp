@@ -440,6 +440,24 @@ the null decoder). No host AAC decoder needed.
     No path of the runtime's own is left that the layouts change; next is NVIDIA Nsight Aftermath for the faulting
     shader and resource. A replay the user alt-tabbed out of lost the device 17 frames after the focus loss: focus
     changes shift the timing and set the race off sooner; 0.4.2's defaults do not have it.
+  - Found with Nsight Aftermath (`runtime/aftermath_win.c`, a development build with `MP4_AFTERMATH_SDK`, run with
+    `MP4_AFTERMATH=1`): the fault was a shader-core *read* that failed to translate, at an address no resource held,
+    with six of our fragment shaders active (VK_EXT_device_fault had said "write invalid", so no write path mattered).
+    The cause, in `vk_exec_draw.c` bind_resources: with independent layouts, a pipeline without a fragment shader
+    (depth, shadow, capture passes) has an empty set 1; the loop that marks where set 1's descriptors start never
+    reached it, so `d0[1]` stayed 0, set 0's size came out 0 and set 0 was neither pushed nor bound. The draw ran
+    with the previous draw's set 0 under another layout and fetched through stale descriptor memory, which is recycled
+    per frame, hence the CPU-ahead and focus timing. The validation layer had said so ("... fs 00000000 ... uses set 0
+    but that set is not bound"); it was taken for its INDEPENDENT_SETS false positive. Fixed: 0 such messages in a
+    75 s validation run, three replays with GPL on and the CPU a frame ahead clean to frame 20,200 at 120 fps. 0.4.3
+    puts GPL back on by default (off on AMD RDNA 1/2 as before). `MP4_DEBUG_SET0_BUG=1` restores the bug for testing
+    crash reports.
+  - Crash reports: on a device loss the runtime writes the VK_EXT_device_fault vendor binary as
+    `gpu-fault-<date>-<time>.bin` beside the log. On NVIDIA it is an Aftermath crash dump behind the extension's
+    56-byte header; `tools/decode_gpu_fault.py` decodes it with the SDK's DLL (page fault, active shaders, warps,
+    full JSON), so players enable nothing. The dump's shader hashes are Aftermath's, which an `MP4_AFTERMATH=1` run
+    maps to the runtime's shader keys. The SDK stays out of the repository and releases (its license distributes only
+    the DLL, not under an open source license); `make_release.py` refuses to run with `MP4_AFTERMATH_SDK` set.
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).

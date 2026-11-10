@@ -805,8 +805,8 @@ NVN_API(nvnWindowAcquireTexture) {
     // submit completed; at a frame's first pop the submits of two frames ago must be done, which on hardware the
     // GPU's pace provides and a replay stalled by pipeline builds does not (the crash in main+0x115980). 0 serialises
     // CPU and GPU frames; a larger n loosens the bound.
-    // 0.4.1 made 0 the default for the device loss past the door out of Sol Valley (issue #7); that loss comes with
-    // graphics pipeline libraries, now off by default (vk_caps.c vk_caps_gpl), so 1 is the default again.
+    // 0.4.1 made 0 the default for the device loss past the door out of Sol Valley (issue #7); its cause was found and
+    // fixed in 0.4.3 (vk_exec_draw.c bind_resources), and 1 has been the default again since 0.4.2.
     static int ahead = -1;
     if (ahead < 0) {
         const char *e = cfg_get("MP4_GPU_AHEAD");
