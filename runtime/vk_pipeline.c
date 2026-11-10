@@ -45,6 +45,7 @@
 // table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
 // (MIT, tools/vendor/ryujinx).
 #include <io.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,6 +122,34 @@ typedef struct Layout {
     VkDescriptorUpdateTemplate tpl[2]; // per set (make_tpl); VK_NULL_HANDLE: written with write structs
     VkDescriptorSetLayoutBinding b[];
 } Layout;
+
+// Debug names under the validation layer (MP4_VK_VALIDATION), which prints them beside the handles: layouts say shared
+// or independent with their sets' hashes and binding counts, pipelines say how they were made and from which shaders.
+static void dbg_name(VkObjectType t, uint64_t h, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void dbg_name(VkObjectType t, uint64_t h, const char *fmt, ...) {
+    static PFN_vkSetDebugUtilsObjectNameEXT f;
+    static int tried;
+    if (!vk_ctx()->validation || !h) return;
+    if (!tried) tried = 1, f = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(P.device, "vkSetDebugUtilsObjectNameEXT");
+    if (!f) return;
+    char name[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(name, sizeof name, fmt, ap);
+    va_end(ap);
+    VkDebugUtilsObjectNameInfoEXT ni = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT, .objectType = t,
+                                        .objectHandle = h, .pObjectName = name};
+    f(P.device, &ni);
+}
+static int gpl_log_on(void) {   // MP4_GPL_LOG=1: every fast link logged (cfg_get: a debug switch without a settings row)
+    static int on = -1;
+    if (on < 0) { const char *e = cfg_get("MP4_GPL_LOG"); on = e && *e && strcmp(e, "0"); }
+    return on;
+}
+static uint32_t sh_id(const GfxShader *sh) {   // the first 4 bytes of the cache key, as the GPL log prints them
+    const uint8_t *k = sh ? gfx_shader_key(sh) : NULL;
+    return k ? (uint32_t)k[0] << 24 | (uint32_t)k[1] << 16 | (uint32_t)k[2] << 8 | k[3] : 0;
+}
 
 typedef struct Pipe {
     struct Pipe *next;
@@ -217,7 +246,11 @@ static int ensure_init(void) {
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
     P.max_push = pd.maxPushDescriptors;
     P.indep = vk_caps.gpl;
-    P.gpl = vk_caps.gpl;
+    // MP4_GPL_FAST=0 (debug, with MP4_GPL=1): the independent layouts GPL needs, but no stage libraries or fast links,
+    // every pipeline built whole; tells a fault of the layouts from one of the libraries (issue #7)
+    const char *gf = cfg_get("MP4_GPL_FAST");
+    P.gpl = vk_caps.gpl && !(gf && !strcmp(gf, "0"));
+    if (vk_caps.gpl && !P.gpl) rt_log("vk_pipeline: MP4_GPL_FAST=0: independent layouts without stage libraries");
     rt_log(P.gpl ? "vk_pipeline: graphics pipeline library on: a draw whose pipeline is building gets a fast-linked one, "
                    "the optimised build replaces it when done"
                  : "vk_pipeline: graphics pipeline library off: draws wait for or skip pipelines that are building");
@@ -1265,6 +1298,7 @@ static Layout *layout_get(Bindings *B) {
         return NULL;
     }
     l->tpl[0] = make_tpl(l->b, l->n, l->set, l->push, l->layout, 0);
+    dbg_name(VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)l->layout, "shared %08x n%u push%d", (uint32_t)h, l->n, l->push);
     l->next = *head;
     *head = l;
     P.stats.layouts++;
@@ -1325,6 +1359,10 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
         return NULL;
     }
     l->tpl[0] = make_tpl(l->b, n0, l->set, l->push, l->layout, 0);
+    dbg_name(VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)l->layout, "indep s0 %08x n%u push%d s1 %08x n%u push%d", (uint32_t)l->set_h[0], n0,
+             l->push, (uint32_t)l->set_h[1], n - n0, l->push1);
+    dbg_name(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)l->set, "set0 %08x n%u push%d", (uint32_t)l->set_h[0], n0, l->push);
+    dbg_name(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)l->set1, "set1 %08x n%u push%d", (uint32_t)l->set_h[1], n - n0, l->push1);
     l->tpl[1] = make_tpl(l->b + n0, n - n0, l->set1, l->push1, l->layout, 1);
     l->next = *head;
     *head = l;
@@ -1666,6 +1704,9 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
+    if (r == VK_SUCCESS)
+        dbg_name(VK_OBJECT_TYPE_PIPELINE, (uint64_t)pipe, "full vs %08x fs %08x %s s0 %08x s1 %08x", sh_id(s->vs), sh_id(s->fs),
+                 l->set1 ? "indep" : "shared", (uint32_t)l->set_h[0], (uint32_t)l->set_h[1]);
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
         pipe = VK_NULL_HANDLE;
@@ -1724,6 +1765,7 @@ static VkPipelineLayout half_layout(Layout *l, int h) {
                                      .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2,
                                      .pSetLayouts = sets};
     if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->half[h]) != VK_SUCCESS) l->half[h] = VK_NULL_HANDLE;
+    dbg_name(VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)l->half[h], "half%d of s0 %08x s1 %08x", h, (uint32_t)l->set_h[0], (uint32_t)l->set_h[1]);
     return l->half[h];
 }
 
@@ -2035,6 +2077,8 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
         if (build) ReleaseSRWLockExclusive(&P.lock);
         uint64_t t1 = qpc();
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        else dbg_name(VK_OBJECT_TYPE_PIPELINE, (uint64_t)pipe, "fast vs %08x fs %08x s0 %08x s1 %08x", sh_id(s->vs), sh_id(s->fs),
+                      (uint32_t)l->set_h[0], (uint32_t)l->set_h[1]);
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
         if (build) AcquireSRWLockExclusive(&P.lock);
         P.g.link_ms += ms;
@@ -2295,6 +2339,12 @@ static DWORD WINAPI pipe_worker(void *arg) {
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
                 j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
+                if (gpl_log_on()) {   // as in the drawing thread's link (vk_pipeline_get)
+                    const uint8_t *vk = j->s.vs ? gfx_shader_key(j->s.vs) : NULL, *fk = j->s.fs ? gfx_shader_key(j->s.fs) : NULL;
+                    rt_log("vk_pipeline: gpl: fast link %p at frame %llu (worker): vs %02x%02x%02x%02x fs %02x%02x%02x%02x xfb %d",
+                           (void *)f, (unsigned long long)gfx_stats().frames, vk ? vk[0] : 0, vk ? vk[1] : 0, vk ? vk[2] : 0,
+                           vk ? vk[3] : 0, fk ? fk[0] : 0, fk ? fk[1] : 0, fk ? fk[2] : 0, fk ? fk[3] : 0, j->k.xfb);
+                }
                 WakeAllConditionVariable(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
@@ -2581,6 +2631,12 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         if (final) p->fast_tried = 1;
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f;
+            if (gpl_log_on()) {   // which pipelines draws use fast-linked, for a device loss with GPL (issue #7)
+                const uint8_t *vk = s->vs ? gfx_shader_key(s->vs) : NULL, *fk = s->fs ? gfx_shader_key(s->fs) : NULL;
+                rt_log("vk_pipeline: gpl: fast link %p at frame %llu (drawing thread): vs %02x%02x%02x%02x fs %02x%02x%02x%02x xfb %d",
+                       (void *)f, (unsigned long long)gfx_stats().frames, vk ? vk[0] : 0, vk ? vk[1] : 0, vk ? vk[2] : 0, vk ? vk[3] : 0,
+                       fk ? fk[0] : 0, fk ? fk[1] : 0, fk ? fk[2] : 0, fk ? fk[3] : 0, k.xfb);
+            }
             job_lower(p->job);
             WakeAllConditionVariable(&done_cv);
         } else if (f) {

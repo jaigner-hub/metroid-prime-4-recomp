@@ -55,12 +55,19 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 // "<frame> DUMP" arms a frame dump two presents later (MP4_DUMP=when), for a scripted look at a scene.
 // <frame> and its hold are 60 Hz ticks of game time since the first present (frame_step_ticks: presents at 60 fps), so
 // the title menus get the presses at the same game time at any frame limit. A line "@<ms> ..." is timed instead: <ms>
-// and its hold are milliseconds of the world clock (frame_step_world_us, game time since the loaded save's first
-// frame), so it lands at the same game time at any frame rate and load length. A timed event shorter than a frame is
+// and its hold are milliseconds of the world clock (frame_step_world_us, display time since the first present), so
+// it lands at the same time at any frame rate; the SYNC lines below keep it there across loads of another length. A timed event shorter than a frame is
 // applied once. In a script with timed lines (a recording) the untimed ones belong before the world clock: they stop
 // when it starts, as the load ends at another tick in each run.
-// at, hold: ticks, or microseconds of the world clock when timed.
-typedef struct { uint64_t at, hold; int bit, stick, timed, host; int32_t x, y; int logged; char text[48]; } ScriptEv;   // host: 1 SHOT, 2 DUMP
+// A line "SYNC <n>" (written by MP4_INPUT_RECORD) re-anchors the timed lines after it: their times count from the
+// moment the run's virtual pool events (memory.c mem_shadow_events, made at loads) first reach n, not from the first
+// present, so a load that takes another length in the replay does not shift what follows. A line after a SYNC the
+// replay has not reached waits for it.
+// at, hold: ticks, or microseconds of the world clock when timed. sync: the SYNC before the line (0: none).
+typedef struct { uint64_t at, hold; int bit, stick, timed, host; int32_t x, y; int logged; uint32_t sync; char text[48]; } ScriptEv;   // host: 1 SHOT, 2 DUMP
+#define SYNC_MAX 4096
+static int64_t sync_at[SYNC_MAX];   // player: world clock (us) at which the run's pool events reached n, -1 not yet
+static uint32_t sync_seen;          // player: pool events counted so far
 static const struct { const char *name; int bit; } script_buttons[] = {
     {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
     {"ZL", B_ZL}, {"ZR", B_ZR}, {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
@@ -77,17 +84,26 @@ static void script_load(void) {
     if (!f) { rt_log("input: cannot open MP4_INPUT_SCRIPT %s", path); return; }
     char line[256];
     int cap = 0, ln = 0;
+    uint32_t cur_sync = 0;
+    for (int i = 0; i < SYNC_MAX; i++) sync_at[i] = -1;
+    sync_at[0] = 0;
     while (fgets(line, sizeof line, f)) {
         ln++;
         char *h = strchr(line, '#');
         if (h) *h = 0;
+        unsigned sn;
+        if (sscanf(line, " SYNC %u", &sn) == 1) {
+            cur_sync = sn < SYNC_MAX ? sn : SYNC_MAX - 1;
+            continue;
+        }
         char name[32];
         double at;
         int off = 0, timed = line[0] == '@';
         if (sscanf(line + timed, "%lf %31s%n", &at, name, &off) < 2 || at < 0) continue;
         off += timed;
         double unit = timed ? 1000.0 : 1.0;   // ms to us, or presents
-        ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
+        ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed,
+                      .sync = timed ? cur_sync : 0};
         long a, b;
         double c;
         if (!strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
@@ -123,10 +139,15 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     if (!script_n) return;
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), tick = frame_step_ticks();
     int64_t w = frame_step_world_us();
+    for (uint32_t c = mem_shadow_events(); sync_seen < c && w >= 0;) {   // SYNC points reached since the last apply
+        if (++sync_seen < SYNC_MAX) sync_at[sync_seen] = w;
+        rt_log("input: script sync %u at %.1f ms", sync_seen, w / 1000.0);
+    }
     for (int i = 0; i < script_n; i++) {
         ScriptEv *e = &script_ev[i];
         if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
-        uint64_t now = e->timed ? (uint64_t)w : tick;
+        if (e->timed && sync_at[e->sync] < 0) continue;   // its SYNC is not reached yet
+        uint64_t now = e->timed ? (uint64_t)(w - sync_at[e->sync]) : tick;
         if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
         if (!e->logged) {
             e->logged = 1;
@@ -155,11 +176,13 @@ static uint64_t rec_stick_from[2];   // tick + 1 at which the current non-zero s
 static int64_t rec_stick_w[2];
 static int32_t rec_stick[2][2];
 static int64_t rec_last_w = -1;      // the world clock at the previous apply
+static uint32_t rec_sync;            // the last SYNC written (pool events, memory.c mem_shadow_events)
+static int64_t rec_sync_w;           // the world clock then: timed lines count from it
 
 // "<tick> <what> <hold>" or "@<ms> <what> <hold ms>": from tick from and world clock from_w to now.
 static void rec_line(uint64_t from, int64_t from_w, uint64_t fr, int64_t w, const char *what) {
     if (from_w >= 0 && w >= from_w)
-        fprintf(rec, "@%.1f %s %.1f\n", from_w / 1000.0, what, (w > from_w ? w - from_w : 1000) / 1000.0);
+        fprintf(rec, "@%.1f %s %.1f\n", (from_w - rec_sync_w) / 1000.0, what, (w > from_w ? w - from_w : 1000) / 1000.0);
     else
         fprintf(rec, "%llu %s %llu\n", (unsigned long long)from, what, (unsigned long long)(fr > from ? fr - from : 1));
 }
@@ -211,6 +234,22 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
             }
     }
     rec_last_w = w;
+    uint32_t sc = mem_shadow_events();
+    if (w >= 0 && sc != rec_sync) {   // a load made or finalized pools: what is held is cut here and goes on after the SYNC
+        for (int i = 0; i < 16; i++)
+            if (rec_down[i]) {
+                rec_line(rec_down[i] - 1, rec_down_w[i], fr, w, script_buttons[i].name);
+                rec_down[i] = fr + 1, rec_down_w[i] = w;
+            }
+        for (int s = 0; s < 2; s++)
+            if (rec_stick_from[s]) {
+                rec_close_stick(s, fr, w);
+                rec_stick_from[s] = fr + 1, rec_stick_w[s] = w;
+            }
+        fprintf(rec, "SYNC %u\n", sc);
+        rec_sync = sc, rec_sync_w = w;
+        wrote = 1;
+    }
     for (int i = 0; i < 16; i++) {
         int bit = script_buttons[i].bit, down = (b >> bit & 1) != 0;
         if (down && !rec_down[i]) rec_down[i] = fr + 1, rec_down_w[i] = w;

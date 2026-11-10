@@ -408,6 +408,19 @@ the null decoder). No host AAC decoder needed.
     driver (`vk_caps.c` vk_caps_gpl; before, only on AMD's RDNA 1/2 branch, for device losses with fast-linked
     pipelines in issue #5, likely the same bug) and puts `MP4_GPU_AHEAD` back to 1. What in the fast links makes the
     store go astray is not found yet.
+  - Unattended reproduction: `MP4_INPUT_RECORD` writes `SYNC <n>` lines whenever the virtual pool creations and
+    finalizations (`memory.c` mem_shadow_events) change, and times the lines after them from there; the player waits
+    for the run to reach n and plays them from that moment. Timed lines had counted from the first present, so a title
+    or save load of another length shifted every move after it, and a replay walked off the route. A recording of the
+    reporter's save from the load through the door (`build/input/friend-route.txt`, 18 SYNC points) replays to the
+    door every time (sync 24, the door's pool finalizations, at 89.1-89.2 s in eight runs). With it, CPU a frame
+    ahead: 0.4.2's defaults 3 of 3 clean; GPL 3 of 3 device losses; GPL with `MP4_BIND_SKIP=0`, `MP4_PUSH_SKIP=0` or
+    `MP4_PUSH_STAGE=fs` lost the device too; `MP4_GPL_FAST=0` (the independent layouts GPL needs, no stage libraries
+    or fast links) 2 of 2 lost, also with the capture pipelines left without the vertex output union. So the
+    trigger is the stage-independent layouts (vertex set 0, fragment set 1, a support buffer each), not the libraries.
+    The layer's "set 0 disturbed" message names the pipeline's own layout on both sides (debug names on layouts and
+    pipelines under validation), its INDEPENDENT_SETS check. GPU-assisted validation disabled itself after an
+    internal error. `MP4_GPL_LOG=1` logs each fast link with its shaders.
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).

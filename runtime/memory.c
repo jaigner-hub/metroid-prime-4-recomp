@@ -55,6 +55,7 @@ static uint64_t shadow_next, shadow_end;   // virtual pool shadow reservations (
 static uint64_t shadow_lo[64], shadow_hi[64];   // the reservations made, for watched()
 static uint8_t shadow_free[64];               // released by nvnMemoryPoolFinalize, kept for the next pool that fits
 static int nshadow;
+static volatile LONG shadow_events;          // reservations and releases (mem_shadow_events: input script sync points)
 static SRWLOCK lock = SRWLOCK_INIT;
 static uint64_t heap_size, alias_bytes;
 static uint8_t *alias_pages;        // 1 per mapped 4 KiB page of the alias region
@@ -325,6 +326,7 @@ uint64_t mem_shadow_reserve(uint64_t size) {
             shadow_free[best] = 0;
             ReleaseSRWLockExclusive(&lock);
             rt_log("memory: virtual pool shadow %#llx+%#llx (reused)", (unsigned long long)shadow_lo[best], (unsigned long long)size);
+            InterlockedIncrement(&shadow_events);
             return shadow_lo[best];
         }
     ReleaseSRWLockExclusive(&lock);
@@ -337,6 +339,7 @@ uint64_t mem_shadow_reserve(uint64_t size) {
             if (nshadow < 64) shadow_lo[nshadow] = at, shadow_hi[nshadow] = at + size, shadow_free[nshadow] = 0, nshadow++;
             ReleaseSRWLockExclusive(&lock);
             rt_log("memory: virtual pool shadow %#llx+%#llx", (unsigned long long)at, (unsigned long long)size);
+            InterlockedIncrement(&shadow_events);
             return at;
         }
     return 0;
@@ -363,6 +366,7 @@ void mem_shadow_release(uint64_t addr) {
     }
     ReleaseSRWLockExclusive(&lock);
     rt_log("memory: virtual pool shadow %#llx released%s", (unsigned long long)addr, i < nshadow ? " (kept as zero pages)" : "");
+    InterlockedIncrement(&shadow_events);
     if (i == nshadow) VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE);
 }
 // 1 when [addr, addr+size) lies in one shadow reservation: committed as zero pages, so a page nothing wrote (no write
@@ -374,6 +378,10 @@ int mem_heap_range(uint64_t *lo, uint64_t *hi) {
     ReleaseSRWLockShared(&lock);
     return *hi > *lo;
 }
+
+// Virtual pool creations and finalizations so far: the game makes them at loads, in the same order in every run, so
+// input recordings resynchronise on them (input_win.c, "SYNC <n>" lines).
+uint32_t mem_shadow_events(void) { return (uint32_t)shadow_events; }
 
 int mem_is_shadow(uint64_t addr, uint64_t size) {
     for (int i = 0; i < nshadow; i++)

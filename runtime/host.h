@@ -163,6 +163,7 @@ uint64_t mem_shadow_reserve(uint64_t size);               // watched storage bel
                                                            // mapped from CPU-visible pool memory; 0 when none fits
 int mem_shadow_commit(uint64_t addr, uint64_t size);       // commits pages of it (zeroed)
 void mem_shadow_release(uint64_t addr);                    // releases a reservation
+uint32_t mem_shadow_events(void);                       // virtual pool creations + finalizations (input sync points)
 int mem_is_shadow(uint64_t addr, uint64_t size);           // the range lies in one shadow reservation
 int mem_heap_range(uint64_t *lo, uint64_t *hi);            // the committed guest heap; 0 before SetHeapSize
 
