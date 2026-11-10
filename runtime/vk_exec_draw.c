@@ -1205,6 +1205,18 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
         if (ex->color[i].image && !(ex->fb_dirty >> i & 1) && vk_pipeline_target_wmask(s, (int)i)) ex->fb_dirty |= 1u << i;
 }
 
+// MP4_STORE_SINK=ssbo|img|all (debug, issue #7): shader stores into written storage buffers (1) and stored images (2)
+// go to the stand-ins instead, to tell which kind of store faults the device.
+static int store_sink(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = cfg_get("MP4_STORE_SINK");
+        v = !e ? 0 : !strcmp(e, "ssbo") ? 1 : !strcmp(e, "img") ? 2 : !strcmp(e, "all") ? 3 : 0;
+        if (v) rt_log("vk_exec: MP4_STORE_SINK=%s: shader stores go to stand-ins", e);
+    }
+    return v;
+}
+
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                           VkDescriptorImageInfo *out, VkImage *image);
 
@@ -1815,6 +1827,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
         } else if (b->kind == GFX_RES_SSBO) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
+            if ((r->flags & 1) && (store_sink() & 1))   // MP4_STORE_SINK: a written storage buffer stores into the zero buffer
+                for (uint32_t k = 0; k < cnt; k++) o[k].buffer = zero_info(LIM.sbo_max);
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
@@ -1834,6 +1848,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
+                    if (img && (r->flags & 4) && (store_sink() & 2))   // MP4_STORE_SINK: a stored image is a stand-in
+                        o[k].image.imageView = storage_dummy(dummy_index(res_view_type(r->type), 0), r->format),
+                        o[k].image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                     // an image the shader stores into: marked written after the lock is released (below)
                     if (img && (r->flags & 4) && h && nstored < (int)(sizeof stored / sizeof stored[0]))

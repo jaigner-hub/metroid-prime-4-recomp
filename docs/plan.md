@@ -426,6 +426,13 @@ the null decoder). No host AAC decoder needed.
     `MP4_VS_UNION=0` (each pipeline's vertex outputs from its own fragment shader, as with shared layouts). Left: what
     differs in the shaders themselves, the fragment stage moved to set 1 (`spirv_set`) against the shared layout's
     renumbered bindings (`spirv_rebind`).
+  - Also with independent layouts and no libraries, each of these lost the device: `MP4_DESC_TEMPLATE=0` (write
+    structs), `MP4_STORE_SINK=all` (every store into a written storage buffer or a stored image sent to the stand-ins),
+    `MP4_SKIP_OPS=XFB_BIND,XFB_BEGIN,XFB_END`, `MP4_SKIP_OPS=COPY_B2B,COPY_B2T,COPY_T2B,COPY_T2T,CLEAR_BUF` and
+    `MP4_SKIP_OPS=REPORT_COUNTER,RESET_COUNTER`, and a replay with nothing touching the window (no focus message or
+    Alt in the log). So the faulting write is no storage store, capture, copy, fill or counter write the replay makes;
+    render targets are left. Alt-tab is not it: 0.4.2's defaults played by hand, focus lost and regained 8 times around
+    the door, ran clean. The window now logs focus changes and Alt / window-menu messages with the frame.
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).

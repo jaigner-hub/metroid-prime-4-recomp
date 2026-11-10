@@ -385,6 +385,11 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
+    if (m == WM_SYSKEYDOWN || m == WM_SYSCOMMAND || m == WM_ENTERMENULOOP || m == WM_EXITMENULOOP) {   // Alt, the window menu
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 64)
+            rt_log("gfx: window message %#x wparam %#llx at frame %llu", m, (unsigned long long)w, (unsigned long long)gfx_stats().frames);
+    }
     switch (m) {
     case WM_KEYDOWN:
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
@@ -450,6 +455,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ACTIVATEAPP: {
         int in = w != 0;
+        rt_log("gfx: window %s focus at frame %llu", in ? "gains" : "loses", (unsigned long long)gfx_stats().frames);
         InterlockedExchange(&g_focused, in);
         oe_set_focus(in);                          // pinned to 1 by MP4_ASSUME_FOCUS inside
         oe_push_message(OE_MSG_FOCUS_STATE_CHANGED);
