@@ -524,6 +524,8 @@ def prove(out):
 
 
 def main():
+    if os.environ.get('MP4_AFTERMATH_SDK'):   # build_game.py would compile NVIDIA's proprietary SDK into the runtime
+        sys.exit('make_release: unset MP4_AFTERMATH_SDK (Nsight Aftermath is for development builds only)')
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--out', type=Path, required=True, help='release folder (replaced)')
     ap.add_argument('--zip', type=Path, help='also write the folder as this zip')

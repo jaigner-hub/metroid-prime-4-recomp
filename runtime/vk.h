@@ -369,6 +369,12 @@ void vk_sync_start(void);                  // vk_init (fatal without a device) a
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
+// aftermath_win.c (MP4_AFTERMATH=1, development builds with MP4_AFTERMATH_SDK only; no-ops otherwise)
+int aftermath_enable(void);                            // before vkCreateDevice: 1 when crash dumps are on
+void aftermath_label(const char *label);               // names the modules this thread makes next
+void aftermath_shader(const uint32_t *code, uint64_t words);   // a module made (its hash -> the label)
+void aftermath_wait(void);                             // after a device loss: until the dump is written
+int aftermath_on(void);
 uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 void vk_sync_finish(void);                 // every submitted value done

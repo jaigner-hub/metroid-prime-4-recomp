@@ -141,6 +141,13 @@ static void dbg_name(VkObjectType t, uint64_t h, const char *fmt, ...) {
                                         .objectHandle = h, .pObjectName = name};
     f(P.device, &ni);
 }
+static uint32_t sh_id(const GfxShader *sh);
+static void am_label(const char *stage, const GfxShader *sh) {   // MP4_AFTERMATH: what the next module is
+    if (!aftermath_on()) return;
+    char l[24];
+    snprintf(l, sizeof l, "%s %08x", stage, sh_id(sh));
+    aftermath_label(l);
+}
 static int vs_union_off(void) {   // MP4_VS_UNION=0 (debug, issue #7): independent layouts add outputs per pipeline, as shared ones
     static int off = -1;
     if (off < 0) { const char *e = cfg_get("MP4_VS_UNION"); off = e && !strcmp(e, "0"); }
@@ -1130,6 +1137,7 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
+    if (r == VK_SUCCESS) aftermath_shader(w, words);   // MP4_AFTERMATH: the module's hash, named by aftermath_label
     free(fixed);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
@@ -1620,7 +1628,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw);
+        if (fcode) am_label("fs", s->fs), fm = make_module(fcode, fw);
     }
     uint32_t *xpatched = NULL;
     if (s->xfb) {   // a capture draw: the vertex shader carries the transform feedback layout
@@ -1637,6 +1645,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             if (f) fwrite(vcode, 4, (size_t)vw, f), fclose(f);
         }
     }
+    am_label("vs", s->vs);
     vm = make_module(vcode, vw);
     free(vpatched), free(fpatched), free(xpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
@@ -1848,6 +1857,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
         }
         else if (pk->xfb) LOG_ONCE("vk_pipeline: cannot add the transform feedback layout to the vertex shader");
+        am_label("vs lib", s->vs);
         m = make_module(vcode, vw);
         free(xp);
         if (!m) goto out;
@@ -1867,6 +1877,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d);
+            am_label("fs lib", s->fs);
             if (!patched || !(m = make_module(patched, fw))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
@@ -2845,6 +2856,7 @@ static void prebuild_start(void) {
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
+    am_label("cs", cs);
     VkShaderModule m = make_module(code, words);
     if (!m) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;

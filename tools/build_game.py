@@ -84,6 +84,11 @@ GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-lab
 # _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain) to
 # Windows 7, which hides the per-monitor DPI functions gfx_window.c and dpi_probe.c call.
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3', '-D_WIN32_WINNT=0x0A00']
+# MP4_AFTERMATH_SDK=<an unpacked NVIDIA Nsight Aftermath SDK>: development builds get GPU crash dumps (MP4_AFTERMATH=1,
+# runtime/aftermath_win.c) with the SDK's headers from there. Its license keeps it out of the repository and releases;
+# tools/make_release.py refuses to run with it set.
+if os.environ.get('MP4_AFTERMATH_SDK'):
+    RT_FLAGS = RT_FLAGS + ['-DMP4_AFTERMATH_SDK', '-I' + os.environ['MP4_AFTERMATH_SDK'].replace('\\', '/') + '/include']
 # -Xlinker passes the map path as one argument; -Wl, would split it at any comma in the build dir path
 LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Xlinker', '"--Map=$builddir/mp4.map"']   # the map feeds tools/prof_report.py
 LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx static (movies)

@@ -250,6 +250,7 @@ typedef struct {
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceImageViewMinLodFeaturesEXT minlod;
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;   // MP4_VK_ADDR_WATCH
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV diag;      // MP4_AFTERMATH (aftermath_win.c)
 } FeatureChain;
 
 static int create_device(void) {
@@ -257,7 +258,7 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[28];
+    const char *ext[32];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
 
@@ -281,6 +282,13 @@ static int create_device(void) {
     OPTIONAL_EXT(has_provoking_vertex, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, pv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
     OPTIONAL_EXT(has_robustness2, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, rob2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     OPTIONAL_EXT(has_device_fault, VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
+    // MP4_AFTERMATH=1 (development builds with the Nsight Aftermath SDK, aftermath_win.c): crash dumps with resource
+    // tracking, shader debug info and automatic checkpoints
+    int aftermath = aftermath_enable() && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+    if (aftermath) {
+        ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME;
+        CHAIN(diag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV);
+    }
     if (addr_watch && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
         ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
         CHAIN(abr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT);
@@ -369,6 +377,11 @@ static int create_device(void) {
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &c->f2, .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    VkDeviceDiagnosticsConfigCreateInfoNV dc = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV, .pNext = di.pNext,
+        .flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
+                 VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV};
+    if (aftermath && c->diag.diagnosticsConfig) di.pNext = &dc;
     VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
@@ -466,6 +479,7 @@ void vk_device_fault_report(VkResult r) {
     AcquireSRWLockExclusive(&lock);
     if (done) { ReleaseSRWLockExclusive(&lock); return; }
     done = 1;
+    aftermath_wait();   // MP4_AFTERMATH: the driver's crash dump first (aftermath_win.c)
     vk_crumbs_report();
     vk_exec_fault_ops();
     VkCtx *c = vk_ctx();
@@ -483,9 +497,30 @@ void vk_device_fault_report(VkResult r) {
     VkDeviceFaultAddressInfoEXT *ai = calloc(n.addressInfoCount + 1, sizeof *ai);
     VkDeviceFaultVendorInfoEXT *vi = calloc(n.vendorInfoCount + 1, sizeof *vi);
     VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
+    // The vendor binary is the driver's own crash dump (on NVIDIA one that the Nsight Aftermath SDK decodes:
+    // toolchain/decode_gpu_fault), written beside the log as gpu-fault-<date>-<time>.bin for crash reports.
     uint64_t binary = n.vendorBinarySize;
-    n.vendorBinarySize = 0;   // the vendor binary is not fetched; its size alone is logged
+    void *vb = binary && binary < (256ull << 20) ? malloc((size_t)binary) : NULL;
+    if (!vb) n.vendorBinarySize = 0;
+    info.pVendorBinaryData = vb;
     if (q == VK_SUCCESS && ai && vi) q = get(c->device, &n, &info);
+    if (vb && (q == VK_SUCCESS || q == VK_INCOMPLETE) && n.vendorBinarySize) {
+        const char *log = rt_log_path();
+        char path[MAX_PATH * 3];
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        snprintf(path, sizeof path, "%s", log ? log : "mp4.log");
+        char *cut = strrchr(path, '\\');
+        if (!cut) cut = strrchr(path, '/');
+        snprintf(cut ? cut + 1 : path, sizeof path - (size_t)(cut ? cut + 1 - path : 0), "gpu-fault-%04u%02u%02u-%02u%02u%02u.bin",
+                 t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(vb, 1, (size_t)n.vendorBinarySize, f), fclose(f);
+            rt_log("vk: the driver's crash dump (%llu bytes) is %s; attach it to a crash report", (unsigned long long)n.vendorBinarySize, path);
+        }
+    }
+    free(vb);
     if (q != VK_SUCCESS && q != VK_INCOMPLETE) {
         rt_log("vk: device lost; vkGetDeviceFaultInfoEXT failed (%d)", (int)q);
     } else {

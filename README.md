@@ -37,6 +37,9 @@ Expect, for now:
   `dump` (about 1 GB, and a short hitch); both paths are relative to the folder the game was started from. The log
   is `logs\mp4.log` next to the exe. The ring copies every frame back from the GPU and lowers the frame rate a lot in
   heavy areas, so remove the `[capture]` lines again once you have the frames.
+- Crashes. To report one, attach `logs\mp4.log` from next to the exe, and, if the GPU crashed, the
+  `logs\gpu-fault-<date>-<time>.bin` written at the same moment (the graphics driver's own crash dump; the log names
+  it). A save from shortly before the crash helps most: your saves are in the `profile` folder next to the exe.
 
 This repository contains no game content. You need your own dump of the game (XCI or NSP), its 1.1.0 update NSP, and
 the keys dumped from your own console. The content check (`tools/check_content.py`, run by the pre-commit hook and
