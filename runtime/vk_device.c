@@ -29,6 +29,37 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
+// MP4_VK_ADDR_WATCH=<hex GPU address>: VK_EXT_device_address_binding_report through a messenger of its own; every
+// bind and unbind of a range holding the address is logged with the object, the frame, the thread and the host return
+// addresses (mp4.exe offsets, for mp4.map). Finds the owner of the address a device fault names (2026-11-10: a write
+// to 0x4bd6000 past the door out of Sol Valley, the same address in two runs).
+static uint64_t addr_watch;
+static VKAPI_ATTR VkBool32 VKAPI_CALL addr_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
+                                              const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
+    (void)sev, (void)user;
+    if (!(type & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT)) return VK_FALSE;
+    const VkDeviceAddressBindingCallbackDataEXT *b = NULL;
+    for (const VkBaseInStructure *n = d->pNext; n; n = n->pNext)
+        if (n->sType == VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) b = (const void *)n;
+    static volatile LONG n_all;   // MP4_VK_ADDR_WATCH=all: the first 40 bindings of any address (is the report on?)
+    if (!b || (addr_watch == ~0ull ? InterlockedIncrement(&n_all) > 40 : addr_watch < b->baseAddress || addr_watch - b->baseAddress >= b->size))
+        return VK_FALSE;
+    void *ret[24];
+    USHORT nr = CaptureStackBackTrace(1, 24, ret, NULL);
+    uintptr_t self = (uintptr_t)GetModuleHandleW(NULL);
+    char st[24 * 20] = "", who[96];
+    size_t o = 0;
+    for (USHORT i = 0; i < nr && o < sizeof st - 20; i++)
+        o += (size_t)snprintf(st + o, sizeof st - o, " %#llx", (unsigned long long)((uintptr_t)ret[i] - self));
+    rt_log("vk: addr watch %#llx: %s %#llx+%#llx, object type %d handle %#llx%s%s, frame %llu, %s; host stack (mp4.exe+):%s",
+           (unsigned long long)addr_watch, b->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "bind" : "unbind",
+           (unsigned long long)b->baseAddress, (unsigned long long)b->size, d->objectCount ? (int)d->pObjects[0].objectType : -1,
+           d->objectCount ? (unsigned long long)d->pObjects[0].objectHandle : 0ull,
+           d->objectCount && d->pObjects[0].pObjectName ? " " : "", d->objectCount && d->pObjects[0].pObjectName ? d->pObjects[0].pObjectName : "",
+           (unsigned long long)gfx_stats().frames, kern_thread_describe(who, sizeof who), st);
+    return VK_FALSE;
+}
+
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) {
     for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1;
     return 0;
@@ -58,7 +89,9 @@ static int create_instance(void) {
         rt_log("vk: MP4_VK_VALIDATION set but %s is not installed; continuing without", layers[0]);
         validate = gpu_assisted = 0;
     }
-    if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    const char *aw = cfg_get("MP4_VK_ADDR_WATCH");
+    addr_watch = aw && !strcmp(aw, "all") ? ~0ull : aw && *aw ? strtoull(aw, NULL, 16) : 0;
+    if (validate || addr_watch) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     if (gpu_assisted) ext[n_ext++] = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
     VkValidationFeatureEnableEXT gpu_en[] = {VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
                                              VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT};
@@ -84,6 +117,19 @@ static int create_instance(void) {
                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = debug_cb};
         if (f) f(g_vk.instance, &mi, NULL, &g_vk.messenger);
+    }
+    if (addr_watch) {
+        PFN_vkCreateDebugUtilsMessengerEXT f =
+            (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.instance, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT mi = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT,
+            .pfnUserCallback = addr_cb};
+        static VkDebugUtilsMessengerEXT am;
+        if (!f || f(g_vk.instance, &mi, NULL, &am) != VK_SUCCESS) addr_watch = 0;
+        rt_log("vk: MP4_VK_ADDR_WATCH %#llx: %s", (unsigned long long)addr_watch, addr_watch ? "messenger on" : "no messenger");
     }
     return 1;
 }
@@ -203,6 +249,7 @@ typedef struct {
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceImageViewMinLodFeaturesEXT minlod;
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;   // MP4_VK_ADDR_WATCH
 } FeatureChain;
 
 static int create_device(void) {
@@ -234,6 +281,12 @@ static int create_device(void) {
     OPTIONAL_EXT(has_provoking_vertex, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, pv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
     OPTIONAL_EXT(has_robustness2, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, rob2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     OPTIONAL_EXT(has_device_fault, VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
+    if (addr_watch && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
+        CHAIN(abr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT);
+    } else if (addr_watch) {
+        rt_log("vk: MP4_VK_ADDR_WATCH: the device has no %s", VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    }
     // Views clamped to the ASTC levels decoded so far (vk_texture.c MP4_ASTC_BUDGET)
     OPTIONAL_EXT(has_min_lod, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, minlod, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT);
     // Ryujinx's SPIR-V declares fragment shader interlock whenever the host reports it (vk_pipeline.c spirv_fixup).

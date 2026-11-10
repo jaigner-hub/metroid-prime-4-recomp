@@ -64,6 +64,7 @@ static int chains;                  // call chains are kept: MP4_PROFILE_RENDER 
 static volatile uint64_t cur_frame; // last presented frame
 static uint64_t frame_lo, frame_hi; // MP4_PROFILE_FRAMES=<lo>-<hi>: sample only while presents lo..hi-1 are pending
 static int64_t world_lo, world_hi;  // MP4_PROFILE_FRAMES=w<lo>-<hi>: only while the world clock is in [lo, hi) s (us)
+static volatile LONG key_gate = -1; // MP4_PROFILE_FRAMES=key: 0 off, 1 on, toggled by F8 (prof_toggle); -1 not keyed
 
 #define SLOW_RING (1u << 15)        // MP4_PROFILE_SLOW: about 0.5 s of samples of every thread
 #define SLOW_DUMPS 64
@@ -226,6 +227,7 @@ static DWORD WINAPI sampler_main(void *arg) {
         if (tick % 64 == 0) refresh_threads(self);
         if (dump_hi) slow_dump();
         if (frame_hi && (cur_frame < frame_lo || cur_frame >= frame_hi)) continue;
+        if (!key_gate) continue;
         if (world_hi) {   // -1 before the world clock starts
             int64_t w = frame_step_world_us();
             if (w < world_lo || w >= world_hi) continue;
@@ -293,6 +295,14 @@ static int cmp_desc(const void *a, const void *b) {
 static int cmp_stack_desc(const void *a, const void *b) {
     uint64_t x = ((const StackCount *)a)->n, y = ((const StackCount *)b)->n;
     return (x < y) - (x > y);
+}
+
+// F8 (gfx_window.c): with MP4_PROFILE_FRAMES=key, starts and stops sampling, for a stretch of play whose frames are
+// not known ahead (an area reached by hand). Several stretches add up in the one profile.
+void prof_toggle(void) {
+    if (key_gate < 0) return;
+    LONG on = InterlockedXor(&key_gate, 1) ^ 1;
+    rt_log("perf: profile sampling %s at frame %llu", on ? "on" : "off", (unsigned long long)cur_frame);
 }
 
 void prof_write(void) {
@@ -365,7 +375,8 @@ void prof_start(void) {
     chains = only_render || only_main || slow_ns || (ch && *ch && strcmp(ch, "0"));
     const char *fr = cfg_get("MP4_PROFILE_FRAMES");
     double wl, wh;
-    if (fr && fr[0] == 'w' && sscanf(fr + 1, "%lf-%lf", &wl, &wh) == 2 && wl >= 0 && wl < wh)
+    if (fr && !strcmp(fr, "key")) key_gate = 0;
+    else if (fr && fr[0] == 'w' && sscanf(fr + 1, "%lf-%lf", &wl, &wh) == 2 && wl >= 0 && wl < wh)
         world_lo = (int64_t)(wl * 1e6), world_hi = (int64_t)(wh * 1e6);
     else if (fr && sscanf(fr, "%llu-%llu", (unsigned long long *)&frame_lo, (unsigned long long *)&frame_hi) != 2) frame_hi = 0;
     MODULEINFO mi;

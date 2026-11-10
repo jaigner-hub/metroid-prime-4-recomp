@@ -1342,12 +1342,16 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     return mem_insert(s);
 }
 
-// The service round trip for a request that is in neither cache. One translation per cache key (per code hash while
-// the use mask is unknown) runs at a time; different shaders run in parallel on the children.
+// The service round trip for a request that is in neither cache. One translation per program (code hash) runs at a
+// time; different programs run in parallel on the children. Keyed by the cache key once the use mask was known, a
+// request with that final key and one still under its provisional key (other full answers, the same masked ones) ran
+// together: the provisional one renamed its files onto the final key while the other read them, found none, and the
+// shader stayed failed for the run, its draws skipped (a pixel shader past the door out of Sol Valley, 2026-11-10).
+// Waiting here, the later request finds the earlier one's result in translate_one's first lookup.
 static const GfxShader *translate(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
                                   const GfxShaderAnswers *a) {
     int away = kern_core_away();
-    const uint8_t *id = r->final ? r->key : r->code_hash;
+    const uint8_t *id = r->code_hash;
     flight_enter(id);
     const GfxShader *s = translate_one(r, stage, control, code, a);
     flight_leave(id);

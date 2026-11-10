@@ -129,8 +129,8 @@ value. Each of two profilers pops one query per frame, so at a frame's first pop
 have completed. Hardware's GPU pace gives that; the host's replay, stalled by a pipeline build, let the CPU run up to
 five submits ahead (seen in the trace) and the pool ran dry in three of six runs. The window acquire now bounds the
 distance: it waits for the GPU to finish the image's last present (as the display's release implies on hardware) and
-for every submit made before the previous acquire (`MP4_GPU_AHEAD`, default 1 frame of overlap; 0 serialises the
-frames). Three scripted runs through the cinematic pass at 59 fps. `nvnSyncWait` logs a blocking wait that times
+for every submit made before the previous acquire (`MP4_GPU_AHEAD`, then default 1 frame of overlap; 0 serialises the
+frames; the default is 0 since 0.4.1, below). Three scripted runs through the cinematic pass at 59 fps. `nvnSyncWait` logs a blocking wait that times
 out and a poll that fails eight times on the same fence, which ruled out a stuck sync first. On the way the game also
 asked for `nvnTextureBuilderGetSparseTileLayout`, answered with Maxwell's 64 KiB tile sizes by bytes per block.
 
@@ -377,6 +377,27 @@ the null decoder). No host AAC decoder needed.
   shader's stored inputs and `spirv_add_xfb` follows it; the earlier inference packed all ten outputs into buffer 0.
   `MP4_DUMP=xfb2` dumps the frame of the first capture into more than one buffer, and a dump writes each program's
   control sections (`prog_<serial>_<stage>.ctl`). Not yet checked: that the area past the door draws right from them.
+- Past the door (2026-11-10, the reporter's save, four runs played by hand):
+  - The frame rate fell from about 110 to 66-75 fps there: the user's `shot_ring = 8` (mp4.ini). The ring waits for
+    the GPU at every present, reads the frame back and filters it on the guest main thread (`boot.c` box_filter and
+    `vk_read_texels`, together more samples than the lifted code on that thread). Without it both sides of the door hold
+    the 120 fps cap (render thread 2.5 ms a frame before, 4.5-5 ms after; GPU 1.6 and 2 ms). Making the ring
+    asynchronous is left.
+  - A pixel shader there was "translator output missing or malformed" and its draws skipped for the run: two
+    translations of one program ran at once, one under its final cache key and one under its provisional key whose
+    masked answers came out the same, and the provisional one renamed its files onto the final key while the other read
+    them. `gfx_shader.c` `translate` now serialises translations per program (code hash). One in 436 logs.
+  - Without the ring the GPU lost the device 1 to 13 s after the door, each time soon after the two-buffer capture
+    (40 to 800 frames): a write to an invalid address (0x4bd6000 twice, 0x5838000 under the address watch).
+    `MP4_VK_ADDR_WATCH=<hex>` (VK_EXT_device_address_binding_report) logs every bind and unbind of a range holding
+    the address; nothing was ever bound there, so it is no freed object but a write through a bad address or offset.
+    With `MP4_GPU_AHEAD=0` (frames serialised, which the ring's per-present wait also gave) 100 s there ran clean, at
+    99 instead of 120 fps. So it is a race between the CPU running a frame ahead and the GPU; the lead is the
+    write-back of the two capture buffers against the game's read of them. 0.4.1 ships with 0 as the default until
+    it is found. `fault-ops.txt` now starts at the oldest submission the GPU had not finished (at most 16 back).
+  - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
+    known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
+    held only the door's own fade).
 
 ## Shared core
 

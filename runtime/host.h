@@ -32,6 +32,7 @@ extern unsigned rt_trace;                       // from MP4_TRACE=svc,host,ipc,f
 // PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
 enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
 void prof_start(void);
+void prof_toggle(void);                         // F8: MP4_PROFILE_FRAMES=key sampling on/off
 void prof_write(void);                          // idempotent; boot.c calls it before _exit
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only

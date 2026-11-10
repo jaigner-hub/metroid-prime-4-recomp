@@ -956,7 +956,8 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
     }
 }
 
-// After a device loss (vk_device.c vk_device_fault_report): the ops of the last three submissions the trace holds,
+// After a device loss (vk_device.c vk_device_fault_report): the ops of the submissions the GPU had not finished (at
+// least the last three, at most 16) the trace holds,
 // decoded into fault-ops.txt next to the log, newest submission last. What the GPU was given where NVIDIA's crumbs
 // cannot say (vk_crumbs.c): the fault lies in the submission the breadcrumbs name, or the one before the submit that
 // failed.
@@ -969,7 +970,11 @@ void vk_exec_fault_ops(void) {
     snprintf(cut ? cut + 1 : path, sizeof path - (size_t)(cut ? cut + 1 - path : 0), "fault-ops.txt");
     FILE *f = fopen(path, "w");
     if (!f) return;
-    uint64_t newest = optrace[(optrace_n - 1) % OPTRACE_N].fence, from = newest > 2 ? newest - 2 : 1;
+    // From the oldest submission the GPU had not finished (vk_sync_fence_done), at most 16 back, and at least the last
+    // three: the GPU can run several submissions behind, and the faulting one is then older than the last three
+    // (2026-11-10: the GPU last reached submission 29633 when the submit of 29639 failed).
+    uint64_t newest = optrace[(optrace_n - 1) % OPTRACE_N].fence, from = newest > 2 ? newest - 2 : 1, done = vk_sync_fence_done();
+    if (done + 1 < from) from = newest - done - 1 > 16 ? newest - 16 : done + 1;
     uint64_t first = optrace_n > OPTRACE_N ? optrace_n - OPTRACE_N : 0, lines = 0;
     fprintf(f, "# ops of submissions %llu..%llu (op, payload words), from the trace of the last %u ops\n",
             (unsigned long long)from, (unsigned long long)newest, OPTRACE_N);

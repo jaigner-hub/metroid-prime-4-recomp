@@ -799,17 +799,21 @@ NVN_API(nvnWindowAcquireTexture) {
     // the newest submit of that present, and the sync means that fence (fenced = 1); an image never presented is
     // free at once (fenced = 3 with fence 0).
     uint64_t f = idx < 4 ? o->fence[idx] : 0;
-    // MP4_GPU_AHEAD=<n> (default 1): the acquire also waits until the GPU completed every submit made before the
+    // MP4_GPU_AHEAD=<n> (default 0, see below): the acquire also waits until the GPU completed every submit made before the
     // n-th last acquire, so the CPU keeps at most n frames of work queued ahead of the GPU whatever the window's
     // image count. This game's pool of GPU timer queries holds three per profiler and refills only from queries whose
     // submit completed; at a frame's first pop the submits of two frames ago must be done, which on hardware the
     // GPU's pace provides and a replay stalled by pipeline builds does not (the crash in main+0x115980). 0 serialises
     // CPU and GPU frames; a larger n loosens the bound.
+    // Stopgap (0.4.1, issue #7): the default is 0 until a race is found. Past the door out of Sol Valley, with one frame
+    // of overlap the GPU lost the device 1 to 13 s after the game's first capture into two transform feedback buffers,
+    // writing to an address nothing was ever bound to (MP4_VK_ADDR_WATCH); serialised, 100 s there ran clean. Frames
+    // serialised cost about 20% there (120 to 99 fps). Back to 1 once the race is fixed (docs/plan.md).
     static int ahead = -1;
     if (ahead < 0) {
         const char *e = cfg_get("MP4_GPU_AHEAD");
-        ahead = e && *e ? atoi(e) : 1;
-        if (ahead < 0 || ahead > 3) ahead = 1;
+        ahead = e && *e ? atoi(e) : 0;
+        if (ahead < 0 || ahead > 3) ahead = 0;
     }
     uint64_t now_f = nvn_fence_last();
     if (o->acquires >= (uint64_t)ahead) {

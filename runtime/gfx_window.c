@@ -395,6 +395,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             cfg_save();
             note_applied();   // what cfg_get reads now (the environment may still override it)
         }
+        if (w == VK_F8 && !(l & (1 << 30))) prof_toggle();   // MP4_PROFILE_FRAMES=key
         if (w == 'P' && !(l & (1 << 30))) {
             rt_shot_ring_dump();   // MP4_SHOT_RING: the last presents to PNGs
             vk_dump_arm(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 2);   // MP4_DUMP=when: the frame after
