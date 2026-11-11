@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/vk_exec_xfer.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged; mirror picks pass the bytes they touch (VK_MEM_PICK).
+// From fe3h-pc-recomp runtime/vk_exec_xfer.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged; mirror picks pass the bytes they touch (VK_MEM_PICK); adds the MP4_OQ_LOG report log, depth-stencil read-backs (copy_ds_to_buffer) and depth-stencil texture copies.
 // From totk-pc-recomp runtime/vk_exec_xfer.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); adds SetCopyImageStride (OP_COPY_IMG_STRIDE) for FE3H.
 // Transfers of the Vulkan op-stream replay: buffer and texture copies, texture
 // clears, event signals, counter reports and conditional rendering. vk_exec.c calls vk_exec_op_xfer for these ops.
@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
@@ -136,9 +137,11 @@ static int oq_open = -1;                 // replay: the slot whose query is acti
 static uint32_t *oq_seg;                 // replay: slots closed since the last report or reset
 static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
+static uint32_t oq_draws, oq_pw, oq_ph;   // replay: the segment's counted draws, its first draw's pass size (MP4_OQ_LOG)
+static uint64_t oq_prog;                 // replay: the program of the segment's first counted draw (MP4_OQ_LOG)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
+typedef struct { uint64_t addr; int reset, lost; uint32_t n, draws, pass_w, pass_h; uint64_t prog; uint32_t q[]; } OqSegment;
 
 static int oq_ready(void) {
     if (oq_state) return oq_state > 0;
@@ -179,6 +182,7 @@ static void oq_close(VkExec *ex) {
 }
 
 void vk_exec_oq_draw(VkExec *ex) {
+    if (oq_counting && !oq_draws++) oq_prog = ex->prog ? ex->prog->serial : 0, oq_pw = ex->pass_w, oq_ph = ex->pass_h;
     if (!oq_counting || oq_open >= 0) return;
     uint32_t q = oq_next % OQ_N;
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
@@ -200,6 +204,25 @@ void vk_exec_xfer_shutdown(void) {
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
+}
+
+// MP4_OQ_LOG=<n> (1: 20000): one line per samples-passed report, up to n lines, for a game's visibility tests (which
+// addresses it reports to, how many queries each covers, the counts it gets back): frame, address, running count,
+// this segment's sum, its query count, whether it missed draws (ring full), its counted draws and the program and pass
+// size of the first (a program number of the MP4_DUMP passes.txt). Completion thread, submit order.
+static void oq_log_report(const OqSegment *s, uint64_t sum) {
+    static long budget = -1;
+    if (budget < 0) {
+        const char *e = cfg_get("MP4_OQ_LOG");
+        long n = e && *e ? atol(e) : 0;
+        budget = n == 1 ? 20000 : n > 0 ? n : 0;
+    }
+    if (budget <= 0) return;
+    budget--;
+    rt_log("oq: frame %llu report %#llx count %llu (segment %llu over %u queries%s, %u draws, first prog %llu in a %ux%u pass)",
+           (unsigned long long)gfx_stats().frames, (unsigned long long)s->addr, (unsigned long long)oq_count,
+           (unsigned long long)sum, s->n, s->lost ? ", lost" : "", s->draws, (unsigned long long)s->prog, s->pass_w,
+           s->pass_h);
 }
 
 static void oq_cb(void *arg) {
@@ -233,6 +256,7 @@ static void oq_cb(void *arg) {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
         if (s->addr) write_counter(s->addr, oq_count);
+        oq_log_report(s, sum);
     }
     free(s);
 }
@@ -243,6 +267,8 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     OqSegment *s = malloc(sizeof *s + sizeof *s->q * oq_nseg);
     if (!s) rt_fatal("vk: out of memory");
     s->addr = addr, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
+    s->draws = oq_draws, s->prog = oq_prog, s->pass_w = oq_pw, s->pass_h = oq_ph;
+    oq_draws = 0, oq_prog = 0;
     memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     oq_nseg = 0, oq_lost = 0;
     vk_completion_add(ex->fence, oq_cb, s);
@@ -332,12 +358,15 @@ typedef struct {
 } Sub;
 
 // Resolves tex, its view and a copy region to image coordinates. 0 (warned) when the copy cannot be replayed.
-static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r, int defaults_to_level,
-                       Sub *s) {
+// ds: a depth-stencil image may be resolved (both aspects, also one stored in another format than the NVN one), for
+// the packed read-back of copy_ds_to_buffer.
+static int sub_resolve_ds(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r, int defaults_to_level,
+                          Sub *s, int ds) {
     memset(s, 0, sizeof *s);
     if (!t) return 0;
     TexVkFormat f;
-    if (!tex_vk_format(t->d.format, &f) || f.vk != f.ideal || f.expand_rgb || f.astc_bw) {
+    int ds_ok = ds && tex_vk_format(t->d.format, &f) && f.depth && f.stencil;
+    if (!ds_ok && (!tex_vk_format(t->d.format, &f) || f.vk != f.ideal || f.expand_rgb || f.astc_bw)) {
         warn_once(W_FORMAT, "copy of format %#x texture (decoded or expanded on upload): skipped", t->d.format);
         return 0;
     }
@@ -350,6 +379,7 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
     const VkTexImage *img = s->img;
     if (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) s->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     else if (img->aspect == VK_IMAGE_ASPECT_DEPTH_BIT) s->aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    else if (ds_ok && img->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) s->aspect = img->aspect;
     else {
         warn_once(W_FORMAT, "copy of depth-stencil format %#x texture: skipped", t->d.format);
         return 0;
@@ -371,6 +401,11 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
         return 0;
     }
     return 1;
+}
+
+static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r, int defaults_to_level,
+                       Sub *s) {
+    return sub_resolve_ds(t, v, has_v, r, defaults_to_level, s, 0);
 }
 
 static VkImageSubresourceLayers sub_layers(const Sub *s) {
@@ -420,7 +455,120 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
     return 1;
 }
 
+// ---- depth-stencil read-back
+// A copy of a combined depth-stencil texture into a buffer. Vulkan copies one aspect at a time, tightly packed (4-byte
+// float depth for D32_SFLOAT_S8_UINT, 1-byte stencil), and DEPTH24_STENCIL8 is always stored as D32_SFLOAT_S8_UINT
+// (vk_formats.c), so the bytes the game expects cannot come from a copy alone: both aspects go to a host-visible staging
+// buffer, and once the GPU is done the completion thread packs them into the guest buffer with the copy's pitches, as
+// the NVN layout has it: DEPTH24_STENCIL8 a 32-bit word with the 24-bit unsigned normalised depth in bits 0-23 and the
+// stencil in 24-31 (Maxwell S8Z24, Vulkan's packed D24_UNORM_S8_UINT; Ryujinx maps NVN's D24S8 render targets to it),
+// DEPTH32F_STENCIL8 8 bytes: the float depth, the stencil, three zero bytes. The guest bytes are written by the CPU,
+// so the pages read as CPU-written (vk_guest_written) and a mirror of the pool takes them on its next use like any
+// other CPU write. Metroid Prime 4's scan visor reads 120x100 depth texels around the reticle this way every frame to
+// tell which scan targets are visible (issue #10): skipped, it read whatever the buffer held.
+typedef struct {
+    VkBuffer buf;
+    VmaAllocation alloc;
+    const uint8_t *map;
+    uint64_t dst, row, img, size;   // guest buffer, its row and image pitches, the bytes it covers
+    uint32_t w, h, nz, bpb, stencil_off;
+} DsReadback;
+
+static void ds_readback_cb(void *arg) {   // completion thread
+    DsReadback *r = arg;
+    vmaInvalidateAllocation(vk_ctx()->vma, r->alloc, 0, VK_WHOLE_SIZE);
+    const float *dep = (const float *)r->map;
+    const uint8_t *st = r->map + r->stencil_off;
+    for (uint32_t z = 0; z < r->nz; z++)
+        for (uint32_t y = 0; y < r->h; y++) {
+            uint8_t *o = (uint8_t *)(uintptr_t)(r->dst + z * r->img + y * r->row);
+            size_t i = ((size_t)z * r->h + y) * r->w;
+            for (uint32_t x = 0; x < r->w; x++, i++) {
+                float d = dep[i];
+                if (r->bpb == 4) {
+                    d = d > 0.0f ? d < 1.0f ? d : 1.0f : 0.0f;   // also NaN to 0
+                    uint32_t v = (uint32_t)(d * 16777215.0f + 0.5f) | (uint32_t)st[i] << 24;
+                    memcpy(o + 4 * x, &v, 4);
+                } else {
+                    uint8_t v[8] = {0};
+                    memcpy(v, &d, 4), v[4] = st[i];
+                    memcpy(o + 8 * x, v, 8);
+                }
+            }
+        }
+    vk_guest_written(r->dst, r->size);
+    vk_defer_buffer(r->buf, r->alloc);
+    free(r);
+}
+
+static void copy_ds_to_buffer(VkExec *ex, const p_copy_b2t *p) {
+    Sub s;
+    if (!sub_resolve_ds(p->tex, &p->view, p->has_view, &p->r, 1, &s, 1)) return;
+    if (s.bpb != 4 && s.bpb != 8) {
+        warn_once(W_FORMAT, "depth-stencil read-back of format %#x (%d bytes a texel): skipped", p->tex->d.format, s.bpb);
+        return;
+    }
+    if (s.img->format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        warn_once(W_FORMAT, "depth-stencil read-back from VkFormat %d: skipped", (int)s.img->format);
+        return;
+    }
+    uint64_t size;
+    VkBufferImageCopy c;
+    VkMemSpan m;
+    if (!buffer_side(ex, &s, p->src, &size, &c, &m)) return;   // the guest buffer's pitches and span
+    if (nvn_gpu_only(p->src)) {
+        warn_once(W_BUFFER, "depth-stencil read-back into a CPU-invisible pool: skipped");
+        return;
+    }
+    uint64_t texels = (uint64_t)s.w * s.h * s.nz, soff = (texels * 4 + 15) & ~15ull;
+    DsReadback *r = calloc(1, sizeof *r);
+    if (!r) rt_fatal("vk: out of memory");
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = soff + texels,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &r->buf, &r->alloc, &info) != VK_SUCCESS || !info.pMappedData) {
+        if (r->buf) vmaDestroyBuffer(vk_ctx()->vma, r->buf, r->alloc);
+        free(r);
+        warn_once(W_BUFFER, "depth-stencil read-back: no staging buffer: skipped");
+        return;
+    }
+    r->map = info.pMappedData;
+    r->dst = p->src, r->size = size, r->w = s.w, r->h = s.h, r->nz = s.nz, r->bpb = (uint32_t)s.bpb;
+    r->row = (uint64_t)c.bufferRowLength * (uint32_t)s.bpb;
+    r->img = r->row * c.bufferImageHeight;
+    r->stencil_off = (uint32_t)soff;
+    vk_exec_pass_end(ex);
+    vk_exec_barrier(ex);
+    s.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    VkBufferImageCopy cc[2] = {
+        {.bufferOffset = 0, .imageSubresource = sub_layers(&s), .imageOffset = sub_offset(&s), .imageExtent = sub_extent(&s)},
+        {.bufferOffset = soff, .imageOffset = sub_offset(&s), .imageExtent = sub_extent(&s)},
+    };
+    s.aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+    cc[1].imageSubresource = sub_layers(&s);
+    vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, r->buf, 2, cc);
+    // The copy made visible to the host. vkCmdPipelineBarrier2: the recorder thread wraps it (vk_rec.h), the first
+    // version is not wrapped and would land in the command buffer out of order.
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 2;
+    vk_usnap_drop(p->src, size);
+    vk_completion_add(ex->fence, ds_readback_cb, r);
+    LOG_ONCE("vk: depth-stencil read-back: format %#x %ux%ux%u at %d,%d into %#llx (row %llu bytes; logged once)",
+             p->tex->d.format, s.w, s.h, s.nz, s.x, s.y, (unsigned long long)p->src, (unsigned long long)r->row);
+}
+
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
+    TexVkFormat tf;
+    if (!to_image && p->tex && tex_vk_format(p->tex->d.format, &tf) && tf.depth && tf.stencil) {
+        copy_ds_to_buffer(ex, p);
+        return;
+    }
     Sub s;
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
     uint64_t size;
@@ -439,11 +587,22 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     Sub s, d;
-    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
-    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
+    // Depth-stencil to depth-stencil: both images hold the same Vulkan format whatever the NVN one says (DEPTH24_STENCIL8
+    // is stored as D32_SFLOAT_S8_UINT, vk_formats.c), so an unscaled copy of both aspects is exact. Metroid Prime 4
+    // copies its scene depth into a second texture this way every frame, before the scan visor's read-back (issue #10).
+    TexVkFormat sf, df;
+    int ds = p->src && p->dst && tex_vk_format(p->src->d.format, &sf) && tex_vk_format(p->dst->d.format, &df) &&
+             sf.depth && sf.stencil && df.depth && df.stencil;
+    if (!sub_resolve_ds(p->src, &p->sv, p->has_sv, &p->sr, 1, &s, ds)) return;
+    if (!sub_resolve_ds(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d, ds)) return;
     d.nz = s.nz;
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
+    if (ds && (!same_size || !same_format || s.img->samples != d.img->samples)) {
+        warn_once(W_COPY, "depth-stencil texture copy %ux%u -> %ux%u (VkFormat %d -> %d, %u -> %u samples): skipped", s.w,
+                  s.h, d.w, d.h, (int)s.img->format, (int)d.img->format, s.img->samples, d.img->samples);
+        return;
+    }
     if (s.img->samples != d.img->samples && !(s.img->samples > 1 && d.img->samples == 1 && same_size && same_format)) {
         warn_once(W_COPY, "texture copy between %u and %u samples: skipped", s.img->samples, d.img->samples);
         return;
