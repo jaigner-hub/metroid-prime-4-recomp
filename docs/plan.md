@@ -484,6 +484,28 @@ the null decoder). No host AAC decoder needed.
     address a `MP4_BREAK_FOLLOW` chain ends at, moved when a later hit's chain ends elsewhere, logging each write that
     changes the value or comes from another function, with the lifted function and the guest frame chain.
     `MP4_BREAK_WRITE_REG` also logs x<n> at those hits whenever it changes (the argument a call is given).
+- Out of VRAM (issue #16, 2026-11-11). On a GTX 1060 6 GB, after the Bombs boss, the next area's light volumes
+  (1408x256x1008 BC, 180-360 MB each) failed to allocate (`vk: image creation failed (-2)`), and draws sampled
+  nothing: corrupted and missing surfaces until a restart. VMA had already tried every memory type the images allow,
+  system memory included (an RTX 4070 reports types 0x3 for that shape, one of them in host memory); the driver refused
+  both. The reporter's log had VRAM at 4.45 of 5.07 GB already in the first area. What held it, found with test caps
+  (`MP4_VRAM_LIMIT_MB`, and `MP4_HOSTMEM_LIMIT_MB` for VMA's other heaps; with the VRAM limit, images take
+  device-local memory only, as on that card) on the Sol Valley door route: the 1.8 GiB asset pool's VRAM mirror,
+  placed in the first area whenever its budget check passes and then kept for the pool's life, beside 1.9 GB of live
+  textures; released textures held only a few MiB.
+  - A failed creation asks for twice its size back. The next submit's sweep frees droppable released textures, largest
+    first (`vk_texture.c` reclaim_oom; not at the failure, since a draw may still hold another entry), and asks the
+    mirrors for the rest; the next recording's start drops mirrors for it, largest first, and those pools stay
+    imported (`vk_memory.c` mirror_evict). Creations of that size are not tried again until the next submit.
+  - Under a 3.5 GB limit the route's first failure (frame ~8,500, a 1024x1024 texture) gave the mirror back and none
+    followed; textures grew to 1.95 GB, VRAM settled at 2.55 GB, black patches the same route showed without the
+    mirror drop were gone. `MP4_MEMORY=verify` with `MP4_TRACE=perf` across the drop: no mismatch before it or in
+    the 24 million page comparisons after it (the other mirrors). Mean fps unchanged on the RTX 4070 (116-120,
+    paced); 1% low 66 against 87-93 with the mirror, not separated from noise.
+  - The VRAM census (`mem: vram frame ...`) is now logged every 18000 frames without `MP4_TRACE=perf`, and once with
+    every heap's usage and budget at the first out-of-memory creation, so a player's log shows what fills the card.
+  - Left: the light volumes are sparse on the console (only mapped tiles backed); full images cost 2.6 GB in the first
+    area. Sparse residency would cut that on every card.
 
 ## Shared core
 

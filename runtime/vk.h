@@ -49,6 +49,7 @@ typedef struct VkCtx {
     int feedback;                           // VK_FEEDBACK_*
     uint32_t min_imported_host_alignment;   // VK_EXT_external_memory_host
     int device_index;                       // index in vkEnumeratePhysicalDevices
+    uint64_t vram_limit;                    // MP4_VRAM_LIMIT_MB in bytes (vk_device.c); 0: the device's own budget
 } VkCtx;
 enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
 
@@ -210,6 +211,8 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
                                                   // with MP4_TRACE=perf, every 1800 frames
+void vk_mem_vram_log(uint64_t frame, const char *why);
+void vk_mem_mirror_evict_request(uint64_t bytes);   // textures out of memory: drop VRAM mirrors at the next recording   // what holds device memory; why: also every heap's budget
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);

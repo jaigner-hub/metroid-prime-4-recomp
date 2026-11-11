@@ -396,8 +396,32 @@ static int create_device(void) {
     vk_caps_init(&g_vk);
     vk_sampler_anisotropy_init(&g_vk);
 
+    // MP4_VRAM_LIMIT_MB / MP4_HOSTMEM_LIMIT_MB (test knobs, default off): VMA allocates no more than that from the
+    // device-local heaps / the other heaps, as on a card with less memory (issue #16: the light volumes of the area
+    // after the Bombs boss failed to allocate on a 6 GB GTX 1060). Imports of guest memory go around VMA and are not
+    // counted. vk_mem_vram reports the device-local limit as the budget, so the VRAM pressure paths see it.
+    VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];
+    int limited = 0;
+    {
+        const char *dl = cfg_get("MP4_VRAM_LIMIT_MB"), *hl = cfg_get("MP4_HOSTMEM_LIMIT_MB");
+        VkDeviceSize dev = dl && *dl ? (VkDeviceSize)strtoull(dl, NULL, 10) << 20 : 0;
+        VkDeviceSize host = hl && *hl ? (VkDeviceSize)strtoull(hl, NULL, 10) << 20 : 0;
+        const VkPhysicalDeviceMemoryProperties mp = g_vk.mem_props;
+        for (uint32_t h = 0; h < VK_MAX_MEMORY_HEAPS; h++) {
+            int devh = h < mp.memoryHeapCount && (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+            VkDeviceSize lim = h < mp.memoryHeapCount ? (devh ? dev : host) : 0;
+            heap_limit[h] = lim ? lim : VK_WHOLE_SIZE;
+            if (lim) {
+                limited = 1;
+                rt_log("vk: heap %u (%.0f MiB%s) limited to %.0f MiB (MP4_%s_LIMIT_MB)", h,
+                       mp.memoryHeaps[h].size / 1048576.0, devh ? ", device-local" : "", lim / 1048576.0,
+                       devh ? "VRAM" : "HOSTMEM");
+                if (devh) g_vk.vram_limit += lim;
+            }
+        }
+    }
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
-                                 .vulkanApiVersion = VK_API_VERSION_1_3,
+                                 .vulkanApiVersion = VK_API_VERSION_1_3, .pHeapSizeLimit = limited ? heap_limit : NULL,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};

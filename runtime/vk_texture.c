@@ -286,6 +286,15 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     }
 }
 
+// Out of memory (issue #16: the light volumes of the area after the Bombs boss, 1408x256x1008 BC, on a 6 GB GTX 1060,
+// while VMA had already tried every allowed memory type, system memory included). A failed creation asks for twice
+// its size back (oom_want); the next submit's sweep (sweep_pressure, reclaim_oom) frees released entries for it,
+// largest first, since a draw may still hold another entry it resolved, so nothing is freed here. Deferred
+// destruction returns that memory once the GPU is past the submission, so creations of that size or more are not
+// tried again until the next submit (oom_epoch, oom_size): each attempt walks every memory type.
+static uint64_t oom_want, oom_size, n_oom;
+static uint32_t oom_epoch;
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile long n_unmapped, n_unsupported, n_failed, n_unbound;
@@ -383,11 +392,32 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         }
     }
     if (!img) {
+        if (oom_size && oom_epoch == submit_epoch && t->L.size >= oom_size) {   // failed at this size since the submit
+            free(e);
+            return NULL;
+        }
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        // Under the MP4_VRAM_LIMIT_MB test limit images take device-local memory only, as on issue #16's GTX 1060,
+        // whose driver refused them system memory too once VRAM was full.
+        if (c->vram_limit)
+            for (uint32_t i = 0; i < c->mem_props.memoryTypeCount; i++)
+                if (c->mem_props.memoryHeaps[c->mem_props.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    ai.memoryTypeBits |= 1u << i;
         VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
+            if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY) {
+                if (!n_oom++) {
+                    char why[160];
+                    snprintf(why, sizeof why, "first image creation out of memory (%.1f MiB of storage)", t->L.size / 1048576.0);
+                    vk_mem_vram_log(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), why);
+                }
+                uint64_t want = 2 * (t->L.size ? t->L.size : 1);
+                if (oom_want < want) oom_want = want;
+                if (oom_epoch != submit_epoch || !oom_size || t->L.size < oom_size) oom_size = t->L.size ? t->L.size : 1;
+                oom_epoch = submit_epoch;
+            }
             free(e);
             return NULL;
         }
@@ -519,7 +549,47 @@ static void sweep_released(void) {
 static int vram_pressure = -1;
 static uint64_t n_pressure_drops;
 
+// Droppable: comes back intact from its storage (sweep_pressure).
+static int droppable(const Tex *e) { return e->pub.mirrored && !e->pub.gpu_owned && !e->gpu_dirty; }
+
+static int by_size_desc(const void *a, const void *b) {
+    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+// After an allocation failure (create_tex): frees droppable released entries with memory of their own, largest
+// first, until oom_want bytes are on their way back.
+static void reclaim_oom(void) {   // tex_lock held
+    VkCtx *c = vk_ctx();
+    uint64_t want = oom_want;
+    oom_want = 0;
+    if (!c || !want) return;
+    int n = 0, cap = 0, nrel = 0;
+    uint64_t (*v)[2] = NULL;   // {bytes, entry}
+    for (Tex *e = rel_head; e; e = e->rel_next) {
+        nrel++;
+        if (!e->alloc || !droppable(e)) continue;
+        if (n == cap && !(v = realloc(v, sizeof *v * (size_t)(cap = cap ? 2 * cap : 256)))) rt_fatal("vk: out of memory (reclaim)");
+        VmaAllocationInfo ai;
+        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+        v[n][0] = ai.size, v[n][1] = (uint64_t)(uintptr_t)e;
+        n++;
+    }
+    if (n) qsort(v, (size_t)n, sizeof *v, by_size_desc);
+    uint64_t freed = 0;
+    int k = 0;
+    for (; k < n && freed < want; k++) freed += v[k][0], destroy_tex((Tex *)(uintptr_t)v[k][1]);
+    free(v);
+    // What released textures could not give back comes from the VRAM mirrors of imported pools (vk_memory.c
+    // mirror_evict), at the start of the recording this sweep precedes.
+    if (freed < want) vk_mem_mirror_evict_request(want - freed);
+    static volatile long n_logged;
+    log_limited(&n_logged, "out of memory: freed %d released textures (%.1f MiB of %.1f MiB asked for; %d released, %d of "
+                "them droppable with memory of their own)", k, freed / 1048576.0, want / 1048576.0, nrel, n);
+}
+
 static void sweep_pressure(void) {   // tex_lock held
+    if (oom_want) reclaim_oom();
     if (vram_pressure < 0) {
         const char *s = cfg_get("MP4_TEX_VRAM_PRESSURE");
         vram_pressure = s && *s ? atoi(s) : 90;
@@ -533,7 +603,7 @@ static void sweep_pressure(void) {   // tex_lock held
     int dropped = 0;
     for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
         next = e->rel_next;
-        if (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty) continue;
+        if (!droppable(e)) continue;
         destroy_tex(e);
         dropped++, n_pressure_drops++;
     }

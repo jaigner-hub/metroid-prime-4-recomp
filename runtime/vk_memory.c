@@ -619,11 +619,11 @@ static void dirty_frame(uint64_t frame);
 static void mirror_log(uint64_t frame);
 static int dead_pending(void);
 
-static void vram_log(uint64_t frame);
-
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
-    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
+    // Every 600 frames with MP4_TRACE=perf, else every 18000 (5 minutes at 60 fps): a player's log then shows whether
+    // device memory grows over a session (issue #16, light volumes failing to allocate after 1.6 hours on 6 GB).
+    if (frame && frame % ((rt_trace & RT_TRACE_PERF) ? 600 : 18000) == 0) vk_mem_vram_log(frame, NULL);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800) mirror_log(frame);   // and the
                                                                                                          // write-watch line
@@ -678,6 +678,15 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     *used = *budget = 0, *exact = 0;
     if (!c) return 0;
     const VkPhysicalDeviceMemoryProperties *mp = &c->mem_props;
+    if (c->vram_limit) {   // MP4_VRAM_LIMIT_MB: what VMA holds in the device-local heaps, against the limit
+        VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(c->vma, vb);
+        for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+            if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) *used += vb[h].statistics.blockBytes;
+        *budget = c->vram_limit;
+        *exact = 1;
+        return 1;
+    }
     if (c->has_memory_budget) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
@@ -1469,7 +1478,62 @@ static void freeze_pass(void) {
     }
 }
 
+// Mirrors given back for textures (issue #16). A mirror is placed while its budget check passes and was then kept for
+// the pool's life: on a 6 GB card the 1.8 GiB asset pool's mirror went in during the first area, and the area after
+// the Bombs boss could not allocate its light volumes. vk_texture.c (reclaim_oom) asks for the bytes released textures
+// could not give back; the next recording's start (vk_mem_mirror_begin, replay thread, where mstate and mbuf change)
+// drops mirrors for them, largest first. The pool then stays imported: the end of each submission has already written
+// the GPU's writes back into it (vk_mem_mirror_end), and its mirror buffer goes once the GPU is past the submissions
+// that may name it. Bindings resolved to the mirror are looked up again (mirror_gen).
+static volatile LONG64 evict_want;
+static uint64_t n_evicted, evicted_bytes;
+
+void vk_mem_mirror_evict_request(uint64_t bytes) {
+    LONG64 cur = evict_want;
+    while ((uint64_t)cur < bytes && InterlockedCompareExchange64(&evict_want, (LONG64)bytes, cur) != cur) cur = evict_want;
+}
+
+static void ranges_drop(MRange *a, int *n, const PoolRec *r) {
+    int k = 0;
+    for (int i = 0; i < *n; i++)
+        if (a[i].r != r) a[k++] = a[i];
+    *n = k;
+}
+
+static void mirror_evict(void) {   // replay thread, before the recording
+    uint64_t want = (uint64_t)InterlockedExchange64(&evict_want, 0), freed = 0;
+    int dropped = 0;
+    if (!want) return;
+    AcquireSRWLockExclusive(&pool_lock);
+    while (freed < want && nm) {
+        PoolRec *r = mlist[0];
+        for (int i = 1; i < nm; i++)
+            if (mlist[i]->import_hi - mlist[i]->import_lo > r->import_hi - r->import_lo) r = mlist[i];
+        uint64_t n = r->import_hi - r->import_lo;
+        mirror_forget(r);
+        r->mstate = MS_REFUSED;
+        ranges_drop(pend, &npend, r);
+        ranges_drop(wbl, &nwbl, r);
+        vk_defer_buffer(r->mbuf, r->malloc_);
+        r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
+        free(r->lsub);
+        r->lsub = NULL;
+        freed += n, dropped++;
+        n_evicted++, evicted_bytes += n;
+        if (n_evicted <= 8)
+            rt_log("mem: pool %#llx+%#llx gives its %.1f MiB VRAM mirror back for textures and stays imported",
+                   (unsigned long long)r->lo, (unsigned long long)r->size, n / 1048576.0);
+    }
+    ReleaseSRWLockExclusive(&pool_lock);
+    if (!dropped) {
+        static int said;
+        if (!said++) rt_log("mem: out of VRAM for textures and no VRAM mirror left to give back (%.1f MiB asked for)",
+                            want / 1048576.0);
+    }
+}
+
 void vk_mem_mirror_begin(void) {
+    if (vk_mirror_on && evict_want) mirror_evict();
     if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
         if (!freeze_idle) return;
         AcquireSRWLockExclusive(&gen_lock);
@@ -1690,10 +1754,11 @@ static void mirror_log(uint64_t frame) {
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
 }
 
-// With MP4_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.
-// VMA's blocks and allocations on the device-local heaps, texture entries with their own memory, the VRAM mirrors and
-// the objects waiting for their last submission to retire.
-static void vram_log(uint64_t frame) {
+// What holds device-local memory, to see what grows over a long session (vk_mem_census), and why an allocation
+// failed (vk_texture.c create_tex, why set): VMA's blocks and allocations on the device-local heaps, texture entries
+// with their own memory, the VRAM mirrors and the objects waiting for their last submission to retire; with why, every
+// heap's usage and budget as well.
+void vk_mem_vram_log(uint64_t frame, const char *why) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     VmaBudget vb[VK_MAX_MEMORY_HEAPS];
@@ -1712,6 +1777,14 @@ static void vram_log(uint64_t frame) {
            alloc_bytes / M, (unsigned long long)t.live, (unsigned long long)t.own_live, t.bytes_live / M,
            (unsigned long long)t.released, (unsigned long long)t.own_released, t.bytes_released / M, (long long)m_live_n,
            m_live_bytes / M, dead_pending());
+    if (!why) return;
+    char line[1024];
+    size_t k = (size_t)snprintf(line, sizeof line, "mem: %s; heaps (vma blocks / vma budget, driver usage / driver budget MiB):", why);
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        k += (size_t)snprintf(line + k, k < sizeof line ? sizeof line - k : 0, " %u: %.0f / %.0f, %.0f / %.0f%s", h,
+                              vb[h].statistics.blockBytes / M, vb[h].budget / M, vb[h].usage / M, vb[h].budget / M,
+                              c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (device-local)" : "");
+    rt_log("%s", line);
 }
 
 // Device class: INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
