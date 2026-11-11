@@ -5,7 +5,8 @@
 // are the tables in input_map.c (mp4.ini overrides them); this file translates Win32 virtual keys to its key ids, reads the mouse (raw input, WM_INPUT)
 // and owns the cursor capture. Keys and their map: docs/controls.md.
 // The gamepad also rumbles (input_rumble) and, when it has a gyro and an accelerometer, feeds the six-axis sensor from a
-// thread of its own (input_motion_start). Every SDL call on the gamepad is made under `lock`.
+// thread of its own (input_motion_start). After start(), every SDL call is made on one gamepad thread (pad_main); the
+// game's threads read the snapshot it publishes (`snap`) and hand it their rumble, so they never wait on the device.
 #include <windows.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -36,7 +37,40 @@ static unsigned pad_layout_seen;
 static volatile LONG pad_layout_shown = -1;   // pad_layout for the menu (any thread), -1 without a gamepad
 static SDL_JoystickID sensor_pad;    // the gamepad whose sensors the motion thread set up, 0 none
 static int sensor_ok;                // ... and it has both sensors, enabled
-static int motion_thread;            // 0 not started, 1 running, -1 off (MP4_MOTION=0, no SDL)
+static volatile LONG motion_wanted;  // the game started the six-axis sensor (input_motion_start): pad_main reads it
+
+// What pad_main last read from the open gamepad, and the rumble the game asked for, under snap_lock (held only to
+// copy). gen counts gamepad changes (open, close), so the layout is picked again. The game's threads read the gamepad
+// only from here: SDL calls on a gamepad that just dropped or came back block for 50 to 600 ms (seen with a Pro
+// Controller over Bluetooth: an update at the drop 600 ms, each update while it is off 56-230 ms, the open 80-120 ms),
+// and made on the game's thread, as they were, each stalled a frame (issue #14).
+static SRWLOCK snap_lock = SRWLOCK_INIT;
+static struct {
+    int connected, rumble, east_a;
+    unsigned gen;
+    uint8_t pd[PAD_COUNT];
+    int16_t axis[4];             // SDL left x, left y, right x, right y
+    uint16_t rum_low, rum_high;  // rumble asked for, applied by pad_main when rum_seq moves
+    uint32_t rum_ms, rum_seq;
+    int rum_triggers;
+} snap;
+
+// A gamepad call or a wait for a lock of 20 ms or more is logged with its thread (at most 200 lines). Since the SDL
+// calls moved to pad_main, the slow ones there no longer reach the game; the lock waits show that they do not.
+enum { SLOW_NS = 20000000 };
+static volatile LONG slow_logged;
+
+static void slow_note(const char *what, uint64_t t0) {
+    uint64_t dt = kern_now_ns() - t0;
+    if (dt < SLOW_NS || InterlockedIncrement(&slow_logged) > 200) return;
+    rt_log("input: %s took %.1f ms (thread %lu)", what, (double)dt / 1e6, GetCurrentThreadId());
+}
+
+static void lock_take(const char *who) {
+    uint64_t t0 = kern_now_ns();
+    AcquireSRWLockExclusive(&lock);
+    slow_note(who, t0);
+}
 
 // SDL buttons of the gamepad inputs (input_map.h PAD_*), by position; PAD_ZL and PAD_ZR are the triggers (axes).
 static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
@@ -494,8 +528,8 @@ static float stick_dead_get(void) {
 }
 
 // One gamepad stick through the dead zone; SDL's Y grows downwards, the Switch's upwards.
-static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
-    input_pad_stick(SDL_GetGamepadAxis(pad, ax), -(int32_t)SDL_GetGamepadAxis(pad, ay), dead, out);
+static void stick(const int16_t ax[2], float dead, int32_t out[2]) {
+    input_pad_stick(ax[0], -(int32_t)ax[1], dead, out);
 }
 
 // Open the first gamepad when none is open or the open one went away; logs once per change.
@@ -503,6 +537,10 @@ static void scan_pads(void) {
     if (pad && SDL_GamepadConnected(pad)) return;
     if (pad) {
         SDL_CloseGamepad(pad); pad = NULL; sensor_pad = 0; sensor_ok = 0;
+        AcquireSRWLockExclusive(&snap_lock);
+        snap.connected = 0, snap.gen++;
+        memset(snap.pd, 0, sizeof snap.pd), memset(snap.axis, 0, sizeof snap.axis);
+        ReleaseSRWLockExclusive(&snap_lock);
         InterlockedExchange(&pad_layout_shown, -1);
         for (int i = 0; i < 4; i++) InterlockedExchange(&pad_labels[i], PAD_LABEL_NONE);
         rt_log("input: gamepad disconnected");
@@ -526,20 +564,23 @@ static void scan_pads(void) {
                                             : lb == SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE ? PAD_LABEL_TRIANGLE
                                                                                       : PAD_LABEL_NONE);
     }
-    pad_layout = -1;
+    AcquireSRWLockExclusive(&snap_lock);
+    snap.rumble = pad_rumble, snap.east_a = pad_east_a, snap.gen++;
+    ReleaseSRWLockExclusive(&snap_lock);
     int motion = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
     rt_log("input: gamepad \"%s\" (%s, %s, east button %s)", SDL_GetGamepadName(pad), pad_rumble ? "rumble" : "no rumble",
            motion ? "gyro and accelerometer" : "no motion sensors", pad_east_a ? "labelled A" : "not labelled A");
 }
 
 // Under lock: the layout of the open gamepad, picked again when a setting or the gamepad changed; logs each change.
-static int pad_layout_get(void) {
+static int pad_layout_get(unsigned gen, int east_a) {
+    static unsigned gen_seen = ~0u;
     unsigned ver = cfg_version();
-    if (pad_layout >= 0 && ver == pad_layout_seen) return pad_layout;
-    pad_layout_seen = ver;
+    if (pad_layout >= 0 && ver == pad_layout_seen && gen == gen_seen) return pad_layout;
+    pad_layout_seen = ver, gen_seen = gen;
     int was = pad_layout;
     const char *set = cfg_value("MP4_PAD_LAYOUT");
-    pad_layout = input_pad_layout_pick(set, pad_east_a);
+    pad_layout = input_pad_layout_pick(set, east_a);
     if (pad_layout != was)
         rt_log("input: gamepad layout %s (pad_layout = %s)", pad_layout == PAD_LAYOUT_XBOX ? "xbox" : "nintendo", set);
     InterlockedExchange(&pad_layout_shown, pad_layout);
@@ -599,6 +640,9 @@ static void test_pad_attach(void) {
     rt_log("input: test gamepad attached, sticks at %d,%d %d,%d", v[0], v[1], v[2], v[3]);
 }
 
+static void snap_publish(void);
+static DWORD WINAPI pad_main(void *arg);
+
 static void start(void) {
     binds_refresh();
     const char *e = cfg_get("MP4_INPUT");
@@ -607,8 +651,14 @@ static void start(void) {
     else state = 1;
     if (state == 1) test_pad_attach();
     if (state == 1) {
-        scan_pads();
+        scan_pads();   // here, so the first poll already has the gamepad; pad_main makes every later SDL call
         if (!pad) rt_log("input: no gamepad (keyboard only until one is connected)");
+        next_scan = GetTickCount64() + RESCAN_MS;
+        SDL_UpdateGamepads();
+        snap_publish();
+        HANDLE h = CreateThread(NULL, 0, pad_main, NULL, 0, NULL);
+        if (!h) rt_fatal("input: gamepad thread CreateThread failed (error %lu)", GetLastError());
+        CloseHandle(h);
     }
     if (state == -1) state = 2;   // keyboard only
 }
@@ -625,34 +675,60 @@ static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     if (b > a) { *x = kx; *y = ky; }
 }
 
-// Under lock, state 1: the open gamepad's inputs by position (pd[PAD_*] != 0 held); 0 without a connected gamepad.
-static int pad_physical(uint8_t pd[PAD_COUNT]) {
-    if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
-    SDL_UpdateGamepads();
-    if (!pad || !SDL_GamepadConnected(pad)) return 0;
-    for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
-    pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
-    pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
-    for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
-    return 1;
+// pad_main, after SDL_UpdateGamepads: the open gamepad's inputs into snap.
+static void snap_publish(void) {
+    uint8_t pd[PAD_COUNT] = {0};
+    int16_t ax[4] = {0};
+    int on = pad && SDL_GamepadConnected(pad);
+    if (on) {
+        for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
+        pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
+        pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+        for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
+        ax[0] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), ax[1] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+        ax[2] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), ax[3] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+    }
+    AcquireSRWLockExclusive(&snap_lock);
+    snap.connected = on;
+    memcpy(snap.pd, pd, sizeof pd), memcpy(snap.axis, ax, sizeof ax);
+    ReleaseSRWLockExclusive(&snap_lock);
+}
+
+// State 1: the gamepad's inputs by position (pd[PAD_*] != 0 held) as pad_main last read them, its sticks (ax, SDL
+// axes) and its change count; 0 without a connected gamepad. Never calls SDL.
+static int pad_physical(uint8_t pd[PAD_COUNT], int16_t ax[4], unsigned *gen, int *east_a) {
+    int16_t a[4];
+    unsigned g;
+    int e;
+    AcquireSRWLockShared(&snap_lock);
+    int on = snap.connected;
+    memcpy(pd, snap.pd, PAD_COUNT), memcpy(a, snap.axis, sizeof a), g = snap.gen, e = snap.east_a;
+    ReleaseSRWLockShared(&snap_lock);
+    if (ax) memcpy(ax, a, sizeof a);
+    if (gen) *gen = g;
+    if (east_a) *east_a = e;
+    return on;
 }
 
 // Under lock, state 1: the open gamepad's buttons (Switch bits after MP4_PAD_LAYOUT and the MP4_BIND_* lines) and
 // sticks; 0 without a connected gamepad.
 static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     uint8_t pd[PAD_COUNT] = {0};
-    if (!pad_physical(pd)) return 0;
-    *b |= input_map_pad_buttons(pd, pad_layout_get());
+    int16_t ax[4];
+    unsigned gen;
+    int east_a;
+    if (!pad_physical(pd, ax, &gen, &east_a)) return 0;
+    *b |= input_map_pad_buttons(pd, pad_layout_get(gen, east_a));
     float dead = stick_dead_get();
-    stick(SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, dead, sl);
-    stick(SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, dead, sr);
+    stick(ax, dead, sl);
+    stick(ax + 2, dead, sr);
     return 1;
 }
 
 static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
-    AcquireSRWLockExclusive(&lock);
+    lock_take("the wait for the input lock (input poll)");
     if (!state) start();
     if (state > 0) {
         binds_refresh();
@@ -736,7 +812,7 @@ void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int
 int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
-    AcquireSRWLockExclusive(&lock);
+    lock_take("the wait for the input lock (pad read)");
     if (!state) start();
     if (state > 0) binds_refresh();
     int ok = state == 1 && pad_read(&b, sl, sr);
@@ -763,7 +839,7 @@ int input_pad_label(int pad_id) {
 }
 
 void input_map_snapshot(InputMap *m) {
-    AcquireSRWLockExclusive(&lock);
+    lock_take("the wait for the input lock (map snapshot)");
     if (!state) start();
     if (state > 0) binds_refresh();
     *m = input_map;
@@ -778,9 +854,9 @@ int input_capture(int reset, int *id) {
     int fg = w && w == GetForegroundWindow();
     for (int i = 1; i < KEY_COUNT; i++) k[i] = fg && key_down(key_vk(i));
     int esc = fg && key_down(VK_ESCAPE);
-    AcquireSRWLockExclusive(&lock);
+    lock_take("the wait for the input lock (capture)");
     if (!state) start();
-    if (state == 1) pad_physical(p);
+    if (state == 1) pad_physical(p, NULL, NULL, NULL);
     ReleaseSRWLockExclusive(&lock);
     int got = INPUT_CAPTURE_NONE;
     if (!reset) {
@@ -805,12 +881,15 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     static int triggers = -1;
     static unsigned seen;
     if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
-    AcquireSRWLockExclusive(&lock);
-    if (state == 1 && pad && pad_rumble) {
-        ok = SDL_RumbleGamepad(pad, low, high, ms);
-        if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
+    if (state != 1) return 0;
+    uint64_t t0 = kern_now_ns();
+    AcquireSRWLockExclusive(&snap_lock);
+    slow_note("the wait for the gamepad snapshot (rumble)", t0);
+    if (snap.connected && snap.rumble) {   // pad_main sends it within 4 ms
+        snap.rum_low = low, snap.rum_high = high, snap.rum_ms = ms, snap.rum_triggers = triggers, snap.rum_seq++;
+        ok = 1;
     }
-    ReleaseSRWLockExclusive(&lock);
+    ReleaseSRWLockExclusive(&snap_lock);
     return ok;
 }
 
@@ -859,27 +938,51 @@ int input_motion_enabled(void) {
     return on;
 }
 
-// 250 Hz: the gamepads update (reports read, rumble expiry) and the newest gyro and accelerometer sample goes into the
-// fusion. Without a gamepad with sensors, or with motion off (MP4_MOTION=0, live), nothing is fed and the six-axis
-// sensor reads at rest.
-static DWORD WINAPI motion_main(void *arg) {
+// The gamepad thread, 250 Hz, the only caller of SDL after start(): a scan for a gamepad (every RESCAN_MS while none
+// is open), the update (reports read, rumble expiry), the snapshot for the game's threads (snap_publish), the rumble
+// they asked for, and, once the game started the six-axis sensor (input_motion_start), the newest gyro and
+// accelerometer sample into the fusion. Without a gamepad with sensors, or with motion off (MP4_MOTION=0, live),
+// nothing is fed and the six-axis sensor reads at rest.
+static DWORD WINAPI pad_main(void *arg) {
     (void)arg;
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    uint32_t rum_done = 0;
     for (;;) {
         if (timer) {
             LARGE_INTEGER due = {.QuadPart = -40000};   // 4 ms
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
         } else Sleep(4);
+        if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) {
+            next_scan = GetTickCount64() + RESCAN_MS;
+            uint64_t t0 = kern_now_ns();
+            scan_pads();
+            slow_note("the gamepad scan (gamepad thread)", t0);
+        }
+        uint64_t t0 = kern_now_ns();
+        SDL_UpdateGamepads();
+        slow_note("the gamepad update (gamepad thread)", t0);
+        snap_publish();
+        AcquireSRWLockShared(&snap_lock);
+        uint32_t seq = snap.rum_seq, ms = snap.rum_ms;
+        uint16_t lo = snap.rum_low, hi = snap.rum_high;
+        int trig = snap.rum_triggers;
+        ReleaseSRWLockShared(&snap_lock);
+        if (seq != rum_done && pad && pad_rumble) {
+            t0 = kern_now_ns();
+            SDL_RumbleGamepad(pad, lo, hi, ms);
+            if (trig) SDL_RumbleGamepadTriggers(pad, hi, hi, ms);   // unsupported pads return false: ignored
+            slow_note("the rumble call (gamepad thread)", t0);
+        }
+        rum_done = seq;
         float a[3], g[3];
         int have = 0;
-        AcquireSRWLockExclusive(&lock);
-        if (pad && SDL_GamepadConnected(pad)) {
-            SDL_UpdateGamepads();
+        if (pad && SDL_GamepadConnected(pad) && InterlockedCompareExchange(&motion_wanted, 0, 0)) {
+            t0 = kern_now_ns();
             have = sensors_ready() && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, a, 3) &&
                    SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
+            slow_note("the sensor read (gamepad thread)", t0);
         }
-        ReleaseSRWLockExclusive(&lock);
         if (!have || !input_motion_enabled()) continue;
         double acc[3], gyro[3];
         input_motion_axes(a, g, acc, gyro);
@@ -889,17 +992,9 @@ static DWORD WINAPI motion_main(void *arg) {
 }
 
 void input_motion_start(void) {
-    AcquireSRWLockExclusive(&lock);
+    lock_take("the wait for the input lock (motion start)");
     if (!state) start();
-    if (!motion_thread) {
-        if (!input_motion_enabled()) rt_log("input: motion off (MP4_MOTION=0); it can be turned on while the game runs");
-        if (state != 1) motion_thread = -1;
-        else {
-            HANDLE h = CreateThread(NULL, 0, motion_main, NULL, 0, NULL);
-            if (!h) rt_fatal("input: motion thread CreateThread failed (error %lu)", GetLastError());
-            CloseHandle(h);
-            motion_thread = 1;
-        }
-    }
     ReleaseSRWLockExclusive(&lock);
+    if (!InterlockedExchange(&motion_wanted, 1) && !input_motion_enabled())
+        rt_log("input: motion off (MP4_MOTION=0); it can be turned on while the game runs");
 }
