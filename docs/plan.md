@@ -461,6 +461,29 @@ the null decoder). No host AAC decoder needed.
   - `MP4_PROFILE_FRAMES=key`: F8 starts and stops the sampling profiler, for a stretch of play whose frames are not
     known ahead. A white flicker of textures the user saw there is not caught yet (two rings, 120 and 600 presents,
     held only the door's own fade).
+- The scan visor (issue #10, 2026-11-10/11). Scan targets were missing, showed through closed doors and scanned
+  unreliably: every frame the visor copies 120x100 texels of the scene's DEPTH24_STENCIL8 target around the reticle
+  into a buffer and reads them back, and the runtime skipped depth-stencil copies to buffers and between textures.
+  0.4.4 replays them (`vk_exec_xfer.c` copy_ds_to_buffer, copy_t2t). With the copy running, the highlight still
+  jumped among nearby targets almost every frame (on the reporter's pad without a gyro and on a Pro Controller;
+  `MP4_GPU_AHEAD=0`, a fixed 60 fps step and motion off changed nothing).
+  - The chain, found with a hardware write watch (`MP4_BREAK_WRITE`, below): the hovered target's id is at +0xa8 of
+    the visor's component, written each frame only by its update (main+0x64250) with the result of main+0x68fd0. That
+    takes a locked id (+0x160 of a targeting object; it held only the door's id while the door was the lock, and is
+    -1 otherwise) and, with none, picks one in main+0x11ff9b0: over the read-back grid (its pointer and size at +0x80
+    and +0xb6c/+0xb70 of the visor's state) each word's `(v & 0x7e) >> 1` minus one is a slot in a table of target
+    ids; the picker counts each target's texels and keeps the one nearest the grid's center. The slot is the stencil
+    the targets were drawn with, so the game's word has the stencil in bits 0-7 and the depth above it. The read-back
+    packed depth in bits 0-23 and the stencil in 24-31 (taken from Maxwell's S8Z24 naming), so the picker read the low
+    bits of the depth, which change from frame to frame. With the order swapped (0.4.5, `ds_readback_cb`), the
+    hovered id changed 24 times in 2,900 frames of moving between the stacked crates by the door, against about 1,800
+    before; a pick holds 40 to 640 frames. Two crates whose edges meet under the reticle still trade places for a few
+    frames, as two equal texel counts would on the console.
+  - `MP4_BREAK_WRITE=<chain>` with `MP4_BREAK_AT`, `MP4_BREAK_WRITE_FROM=<module>+0x<offset>` (the return address of
+    the break that arms it) and optionally `MP4_BREAK_WRITE_REG=<n>`: a write watchpoint in debug register 0 on the
+    address a `MP4_BREAK_FOLLOW` chain ends at, moved when a later hit's chain ends elsewhere, logging each write that
+    changes the value or comes from another function, with the lifted function and the guest frame chain.
+    `MP4_BREAK_WRITE_REG` also logs x<n> at those hits whenever it changes (the argument a call is given).
 
 ## Shared core
 

@@ -25,6 +25,7 @@
 #include <bcrypt.h>
 #include <limits.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <timeapi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -282,6 +283,155 @@ static void break_follow(const Cpu *c) {
     }
 }
 
+// MP4_BREAK_WRITE=[x<n>:]<off>[,<off>...]@<off>: a hardware write watchpoint (debug register 0, 4 bytes) on the
+// address that chain ends at, in MP4_BREAK_FOLLOW's syntax, for finding which function writes a field. It is armed at
+// the MP4_BREAK_AT hits whose return address is MP4_BREAK_WRITE_FROM=<module>+0x<offset> (any hit when unset) and moved
+// when a later hit's chain ends elsewhere (another object took over); those hits log nothing else, except x<n> when
+// it changes with MP4_BREAK_WRITE_REG=<n> (the argument the broken call gets). A write logs the lifted function that
+// made it, the value before and after, the frame and the guest frame chain, unless the same function wrote the same
+// value last time (a field rewritten every frame: counted, and the count goes with the next logged write); up to
+// 20,000 writes. The watch goes on every thread alive when it is armed (the game's threads exist by then); threads
+// made later are not watched. The async preemption's Get/SetThreadContext (kernel.c) asks for CONTROL and INTEGER
+// only, which leaves the debug registers alone. Found the scan visor's picker (issue #10, docs/plan.md).
+static uint64_t lifted_function(uintptr_t rip);   // below, with the crash reporter
+static int readable(uint64_t a, uint64_t n);
+static volatile uint64_t g_wwatch_addr;
+static volatile LONG g_wwatch_armed, g_wwatch_hits;
+static uint32_t g_wwatch_last;
+
+static LONG CALLBACK wwatch_handler(EXCEPTION_POINTERS *ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(ep->ContextRecord->Dr6 & 1) || !g_wwatch_addr)
+        return EXCEPTION_CONTINUE_SEARCH;
+    ep->ContextRecord->Dr6 = 0;
+    LONG n = InterlockedIncrement(&g_wwatch_hits);
+    if (n > 20000) return EXCEPTION_CONTINUE_EXECUTION;
+    uint32_t now = *(volatile uint32_t *)(uintptr_t)g_wwatch_addr, was = g_wwatch_last;
+    g_wwatch_last = now;
+    uint64_t f = lifted_function((uintptr_t)ep->ContextRecord->Rip);
+    // A write of the same value by the same function as the last one is counted, not logged (a field rewritten
+    // every frame).
+    static uint64_t last_f;
+    static LONG same;
+    if (now == was && f == last_f) {
+        same++;
+        InterlockedDecrement(&g_wwatch_hits);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    last_f = f;
+    char d[128], chain[512] = "";
+    size_t k = 0;
+    const Cpu *c = kern_cpu();
+    if (c) {   // the guest frame chain, as the crash reporter walks it: [fp] the caller's fp, [fp+8] its return address
+        uint64_t fp = c->x[29];
+        for (int i = 0; i < 6 && fp && !(fp & 7) && readable(fp, 16) && k < sizeof chain - 140; i++) {
+            uint64_t next = LD64(fp), lr = LD64(fp + 8);
+            k += (size_t)snprintf(chain + k, sizeof chain - k, " < %s", ldr_describe(lr, d, sizeof d));
+            if (next <= fp || next - fp > (64u << 20)) break;
+            fp = next;
+        }
+    }
+    rt_log("break write: frame %llu thread %lu: %#x -> %#x by %s%s (%ld repeats before)",
+           (unsigned long long)gfx_stats().frames, GetCurrentThreadId(), was, now,
+           f ? ldr_describe(f, d, sizeof d) : "host code", chain, (long)same);
+    same = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static DWORD WINAPI wwatch_arm_thread(void *arg) {   // a thread cannot set its own debug registers while it runs
+    (void)arg;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 1;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    int armed = 0, failed = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!h) { failed++; continue; }
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT ctx = {.ContextFlags = CONTEXT_DEBUG_REGISTERS};
+            if (GetThreadContext(h, &ctx)) {
+                ctx.Dr0 = g_wwatch_addr;
+                ctx.Dr7 = (ctx.Dr7 & ~0xf0003ull) | 1 | (1ull << 16) | (3ull << 18);   // L0, write, 4 bytes
+                if (SetThreadContext(h, &ctx)) armed++;
+                else failed++;
+            } else failed++;
+            ResumeThread(h);
+        } else failed++;
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    rt_log("break write: watching %#llx on %d threads (%d failed)", (unsigned long long)g_wwatch_addr, armed, failed);
+    return 0;
+}
+
+// The address chain s ends at from c's registers, as break_follow reads it; 0 if a pointer on the way is null.
+static uint64_t chain_end(const Cpu *c, const char *s) {
+    int reg = 0;
+    if (s[0] == 'x' && s[1] >= '0' && s[1] <= '9') {
+        char *end;
+        long r = strtol(s + 1, &end, 10);
+        if (*end == ':' && r >= 0 && r <= 30) reg = (int)r, s = end + 1;
+    }
+    uint64_t q = c->x[reg];
+    while (*s && q) {
+        char *end;
+        if (*s == '@') return q + strtoull(s + 1, NULL, 16);
+        uint64_t off = strtoull(s, &end, 16);
+        if (end == s) break;
+        q = guest_readable(q + off, 8) ? *(const uint64_t *)(uintptr_t)(q + off) : 0;
+        s = *end == ',' ? end + 1 : end;
+    }
+    return q;
+}
+
+// At a break: arm or move the write watch (MP4_BREAK_WRITE). Returns 1 while a watch is configured, so the hit logs
+// nothing more.
+static int wwatch_break(const Cpu *c) {
+    const char *spec = cfg_get("MP4_BREAK_WRITE");
+    if (!spec || !*spec) return 0;
+    static uint64_t from = ~0ull;
+    if (from == ~0ull) {
+        from = 0;
+        const char *e = cfg_get("MP4_BREAK_WRITE_FROM"), *plus = e ? strchr(e, '+') : NULL;
+        for (int i = 0; plus && i < ldr_count(); i++)
+            if ((size_t)(plus - e) == strlen(ldr_module(i)->name) &&
+                !strncmp(ldr_module(i)->name, e, (size_t)(plus - e)))
+                from = ldr_module(i)->base + strtoull(plus + 1, NULL, 16);
+    }
+    if (from && c->x[30] != from) return 1;
+    static int reg = -2;
+    if (reg == -2) {
+        const char *e = cfg_get("MP4_BREAK_WRITE_REG");
+        reg = e && *e ? atoi(e) : -1;
+        if (reg < 0 || reg > 30) reg = -1;
+    }
+    static uint64_t last_reg = ~0ull;
+    if (reg >= 0 && c->x[reg] != last_reg) {
+        rt_log("break write: frame %llu: x%d %#llx (was %#llx)", (unsigned long long)gfx_stats().frames, reg,
+               (unsigned long long)c->x[reg], (unsigned long long)last_reg);
+        last_reg = c->x[reg];
+    }
+    // The chain is resolved at every matching hit and the watch moves when its end does (another object took over).
+    uint64_t a = chain_end(c, spec) & ~3ull;
+    if (!a || a == g_wwatch_addr || !guest_readable(a, 4) || InterlockedExchange(&g_wwatch_armed, 1)) return 1;
+    g_wwatch_last = *(volatile uint32_t *)(uintptr_t)a;
+    uint64_t was = g_wwatch_addr;
+    g_wwatch_addr = a;
+    static int handler;
+    if (!handler) {
+        handler = 1;
+        lifted_function(0);   // builds its table here, not inside the exception handler
+        AddVectoredExceptionHandler(1, wwatch_handler);
+    }
+    rt_log("break write: frame %llu: arming %#llx (now %#x, was watching %#llx) from %s",
+           (unsigned long long)gfx_stats().frames, (unsigned long long)a, g_wwatch_last, (unsigned long long)was, spec);
+    HANDLE t = CreateThread(NULL, 0, wwatch_arm_thread, NULL, 0, NULL);
+    if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+    InterlockedExchange(&g_wwatch_armed, 0);
+    return 1;
+}
+
 void fnprof_hit(uint64_t addr, void *cpu) {
     const Cpu *c = cpu;
     static volatile LONG resolved;
@@ -298,6 +448,7 @@ void fnprof_hit(uint64_t addr, void *cpu) {
     }
     for (int k = 0; k < g_break_count; k++) {
         if (addr != g_breaks[k].addr) continue;
+        if (wwatch_break(c)) continue;
         // MP4_BREAK_BRIEF=1: one line per hit with x0..x3 and 32 bytes at x0+0x30, up to 400,000 hits, for a value's
         // trajectory over a run; otherwise the full dump, 4,000 hits.
         // MP4_BREAK_COUNT=1: no line per hit; hits are counted per caller, and every 10 s the callers with the most
