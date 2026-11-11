@@ -460,9 +460,12 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 // float depth for D32_SFLOAT_S8_UINT, 1-byte stencil), and DEPTH24_STENCIL8 is always stored as D32_SFLOAT_S8_UINT
 // (vk_formats.c), so the bytes the game expects cannot come from a copy alone: both aspects go to a host-visible staging
 // buffer, and once the GPU is done the completion thread packs them into the guest buffer with the copy's pitches, as
-// the NVN layout has it: DEPTH24_STENCIL8 a 32-bit word with the 24-bit unsigned normalised depth in bits 0-23 and the
-// stencil in 24-31 (Maxwell S8Z24, Vulkan's packed D24_UNORM_S8_UINT; Ryujinx maps NVN's D24S8 render targets to it),
-// DEPTH32F_STENCIL8 8 bytes: the float depth, the stencil, three zero bytes. The guest bytes are written by the CPU,
+// the NVN layout has it: DEPTH24_STENCIL8 a 32-bit word with the stencil in bits 0-7 and the 24-bit unsigned
+// normalised depth in 8-31 (OpenGL's UNSIGNED_INT_24_8 order), DEPTH32F_STENCIL8 8 bytes: the float depth, the
+// stencil, three zero bytes. The DEPTH24_STENCIL8 order is the game's: the scan visor's picker (main+0x11ff9b0) takes
+// a target's slot from bits 1-6 of each word, `(v & 0x7e) >> 1` minus one. Depth in bits 0-23, as this was first
+// written, handed it the low bits of the depth, which change from frame to frame, and the highlight jumped between
+// nearby targets (issue #10). The guest bytes are written by the CPU,
 // so the pages read as CPU-written (vk_guest_written) and a mirror of the pool takes them on its next use like any
 // other CPU write. Metroid Prime 4's scan visor reads 120x100 depth texels around the reticle this way every frame to
 // tell which scan targets are visible (issue #10): skipped, it read whatever the buffer held.
@@ -487,7 +490,7 @@ static void ds_readback_cb(void *arg) {   // completion thread
                 float d = dep[i];
                 if (r->bpb == 4) {
                     d = d > 0.0f ? d < 1.0f ? d : 1.0f : 0.0f;   // also NaN to 0
-                    uint32_t v = (uint32_t)(d * 16777215.0f + 0.5f) | (uint32_t)st[i] << 24;
+                    uint32_t v = (uint32_t)(d * 16777215.0f + 0.5f) << 8 | st[i];
                     memcpy(o + 4 * x, &v, 4);
                 } else {
                     uint8_t v[8] = {0};
