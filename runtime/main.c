@@ -241,21 +241,32 @@ static void break_dump(const char *what, uint64_t a, size_t n) {
     }
 }
 
-// MP4_BREAK_FOLLOW=[x<n>:]<off>[,<off>...][@<off>]: from x0 (or x<n>), load the pointer at each offset in turn and
-// dump 64 bytes at the end of the chain, from "@<off>" into the final object (an object reached through a list entry,
-// say: its first word is its vtable).
+// MP4_BREAK_FOLLOW=[x<n>:]<off>[,<off>...][@<off>[/<len>]][;...]: from x0 (or x<n>, any of x0..x30), load the pointer
+// at each offset in turn and dump 64 bytes (or <len>, hex, at most 0x1000) at the end of the chain, from "@<off>" into
+// the final object (an object reached through a list entry, say: its first word is its vtable). Chains separated by
+// ';' are dumped in turn, for several objects at one break (a callee-saved register still holds the caller's value
+// at a function's entry).
 static void break_follow(const Cpu *c) {
     const char *follow = cfg_value("MP4_BREAK_FOLLOW");
-    if (follow && *follow) {
+    for (const char *s = follow ? follow : ""; *s;) {
         int reg = 0;
-        const char *s = follow;
-        if (s[0] == 'x' && s[1] >= '0' && s[1] <= '7' && s[2] == ':') reg = s[1] - '0', s += 3;
-        uint64_t q = c->x[reg], at = 0;
+        if (s[0] == 'x' && s[1] >= '0' && s[1] <= '9') {
+            char *end;
+            long r = strtol(s + 1, &end, 10);
+            if (*end == ':' && r >= 0 && r <= 30) reg = (int)r, s = end + 1;
+        }
+        uint64_t q = c->x[reg], at = 0, len = 64;
         char chain[96];
         snprintf(chain, sizeof chain, "x%d", reg);
-        for (; *s && q;) {
+        while (*s && *s != ';' && q) {
             char *end;
-            if (*s == '@') { at = strtoull(s + 1, &end, 16); s = end; break; }
+            if (*s == '@') {
+                at = strtoull(s + 1, &end, 16);
+                s = end;
+                if (*s == '/') len = strtoull(s + 1, &end, 16), s = end;
+                if (len < 1 || len > 0x1000) len = 64;
+                break;
+            }
             uint64_t off = strtoull(s, &end, 16);
             if (end == s) break;
             q = guest_readable(q + off, 8) ? *(const uint64_t *)(uintptr_t)(q + off) : 0;
@@ -264,8 +275,10 @@ static void break_follow(const Cpu *c) {
         }
         if (q) {
             snprintf(chain + strlen(chain), sizeof chain - strlen(chain), "=%#llx+%#llx", (unsigned long long)q, (unsigned long long)at);
-            break_dump(chain, q + at, 64);
+            break_dump(chain, q + at, (size_t)len);
         }
+        s += strcspn(s, ";");   // the rest of a chain that ended early (null pointer, unreadable slot)
+        if (*s == ';') s++;
     }
 }
 
