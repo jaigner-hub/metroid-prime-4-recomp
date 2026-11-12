@@ -360,5 +360,102 @@ class XciTrim(unittest.TestCase):
             container_entries(f, len(f.getvalue()))
 
 
+class FakeWineTool:
+    """MP4: stands in for wine.Tool. A thread writes `chunks` to the log (a line may be split across two writes), then
+    the tool ends with `code`; with hang it never ends."""
+
+    def __init__(self, log, chunks, code, hang=False):
+        import threading
+        self.log, self.code, self.done, self.killed, self.cleaned = Path(log), None, False, False, False
+        self.upid_file = Path(str(log) + '.upid')
+
+        def write():
+            import time
+            for c in chunks:
+                with open(self.log, 'ab') as f:
+                    f.write(c)
+                time.sleep(0.05)
+            if not hang:
+                self.code, self.done = code, True
+        threading.Thread(target=write, daemon=True).start()
+
+    def poll(self):
+        return self.code
+
+    def started(self):
+        return True
+
+    def shell_done(self):
+        return self.done
+
+    def kill(self):
+        self.killed = True
+
+    def cleanup(self):
+        self.cleaned = True
+
+
+class WineToolTest(unittest.TestCase):
+    """MP4: run_tool under Wine (installer/wine.py, issue #11) without Wine: the log-following loop with a fake tool,
+    the pipe fallback, and RUN_SCRIPT's process id file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.lines = []
+        self.ctx = SimpleNamespace(temp=self.dir, wine={'version': 'test'},
+                                   reporter=SimpleNamespace(log=lambda text: None),
+                                   layout=SimpleNamespace(python=Path(sys.executable), root=self.dir))
+        self.real_start = steps.wine.start_tool
+
+    def tearDown(self):
+        steps.wine.start_tool = self.real_start
+        self.tmp.cleanup()
+
+    def test_info_is_none_off_wine(self):
+        self.assertIsNone(steps.wine.info())
+
+    def test_log_is_followed_and_the_code_returned(self):
+        tools = []
+        steps.wine.start_tool = lambda command, log, cwd, env: tools.append(
+            FakeWineTool(log, [b'first\r\nsec', b'ond\n', b'wine: an assertion\n', b'no newline at the end'],
+                         0x80000100)) or tools[0]
+        code, log = steps.run_tool(self.ctx, 'lift', self.dir / 'gen.py', [], parse=self.lines.append)
+        self.assertEqual(code, 0x80000100)
+        self.assertEqual(self.lines, ['first', 'second', 'wine: an assertion', 'no newline at the end'])
+        self.assertTrue(tools[0].cleaned)
+        self.assertEqual(log, self.dir / 'logs' / 'lift-gen.log')
+
+    def test_cancel_kills_the_tool(self):
+        tools = []
+        steps.wine.start_tool = lambda command, log, cwd, env: tools.append(
+            FakeWineTool(log, [b'working\n'], 0, hang=True)) or tools[0]
+
+        def parse(line):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            steps.run_tool(self.ctx, 'lift', self.dir / 'gen.py', [], parse=parse)
+        self.assertTrue(tools[0].killed)
+        self.assertTrue(tools[0].cleaned)
+
+    def test_no_shell_route_falls_back_to_the_pipe(self):
+        steps.wine.start_tool = lambda command, log, cwd, env: None
+        script = self.dir / 'tool.py'
+        script.write_text('import sys\nprint("through the pipe")\nsys.exit(3)\n')
+        code, log = steps.run_tool(self.ctx, 'lift', script, [], parse=self.lines.append)
+        self.assertEqual((code, self.lines), (3, ['through the pipe']))
+
+    def test_run_script_writes_its_process_id(self):
+        import os
+        import subprocess
+        script, pid_file = self.dir / 'tool.py', self.dir / 'tool.pid'
+        script.write_text('import os\nprint(os.getpid(), os.environ.get("MP4_TOOL_PID_FILE"))\n')
+        r = subprocess.run([sys.executable, '-c', steps.extract.RUN_SCRIPT, str(script)], capture_output=True,
+                           text=True, env=dict(os.environ, MP4_TOOL_PID_FILE=str(pid_file)))
+        pid, inherited = r.stdout.split()
+        self.assertEqual(pid_file.read_text(), pid)
+        self.assertEqual(inherited, 'None')   # popped, so the tool's own children do not overwrite it
+
+
 if __name__ == '__main__':
     unittest.main()

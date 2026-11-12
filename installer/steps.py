@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import ini
+from . import ini, wine
 from .layout import EXE, SUPPORTED, version_tag
 from .runner import InstallError, Step
 
@@ -103,13 +103,21 @@ def kill_tree(proc):
 
 def run_tool(ctx, step, script, args, parse=None, cwd=None):
     """Run a tool script with the bundled Python. Its output goes to <temp>/logs/<step>-<script>.log and, line by line,
-    to parse(line). Returns (exit code, log path)."""
+    to parse(line). Returns (exit code, log path).
+
+    -X faulthandler: a crash in native code (numpy, capstone) prints the Python stack to the log; without it such a
+    crash leaves an empty log and only an exit code (issue #11: under Proton, gen.py died before its first line)."""
     logs = ctx.temp / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f'{step}-{Path(script).stem}.log'
-    command = [str(ctx.layout.python), '-c', extract.RUN_SCRIPT, str(script), *map(str, args)]
-    ctx.reporter.log('run ' + ' '.join(command[3:]))
+    command = [str(ctx.layout.python), '-X', 'faulthandler', '-c', extract.RUN_SCRIPT, str(script), *map(str, args)]
+    ctx.reporter.log('run ' + ' '.join(command[5:]))
     env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+    if ctx.wine:
+        code = run_tool_wine(ctx, command, log, cwd or ctx.layout.root, env, parse)
+        if code is not None:
+            ctx.reporter.log(f'{Path(script).name}: exit code {code}; output in {log}')
+            return code, log
     with open(log, 'w', encoding='utf-8', newline='\n') as out:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd or ctx.layout.root,
                                 env=env, text=True, encoding='utf-8', errors='replace', bufsize=1)
@@ -124,6 +132,61 @@ def run_tool(ctx, step, script, args, parse=None, cwd=None):
             raise
     ctx.reporter.log(f'{Path(script).name}: exit code {code}; output in {log}')
     return code, log
+
+
+WINE_START_SECONDS = 60   # MP4: how long the /bin/sh route may take to show a sign of life before the pipe is used
+
+
+def run_tool_wine(ctx, command, log, cwd, env, parse):
+    """MP4: run_tool under Wine or Proton. The tool runs through /bin/sh (wine.start_tool), so Wine's own messages go
+    to its log too; the log is read as it grows for parse(). Returns the exit code, or None when the shell route does
+    not work here (the caller then uses a pipe)."""
+    log.write_bytes(b'')
+    tool = wine.start_tool(command, log, cwd, env)
+    if tool is None:
+        ctx.reporter.log('wine: /bin/sh not available for tools; their output goes through a pipe')
+        return None
+    pos, partial = 0, b''
+
+    def drain(final=False):
+        nonlocal pos, partial
+        with open(log, 'rb') as f:
+            f.seek(pos)
+            data = f.read()
+        pos += len(data)
+        lines = (partial + data).split(b'\n')
+        partial = b'' if final else lines.pop()
+        if parse:
+            for line in lines:
+                if line.strip():
+                    parse(line.decode('utf-8', errors='replace').rstrip())
+
+    t0 = time.monotonic()
+    try:
+        while tool.poll() is None:
+            drain()
+            if (not tool.started() and not tool.upid_file.exists()
+                    and time.monotonic() - t0 > WINE_START_SECONDS):
+                tool.kill()
+                ctx.reporter.log(f'wine: the tool showed no sign of starting through /bin/sh in '
+                                 f'{WINE_START_SECONDS} s; running it through a pipe')
+                return None
+            time.sleep(0.2)
+        # The shell writes its status after the last of the tool's output (and Wine's) reached the log.
+        deadline = time.monotonic() + 10
+        while not tool.shell_done() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        drain(final=True)
+        code = tool.poll()
+        if not tool.started() and code in (126, 127) and not log.stat().st_size:
+            ctx.reporter.log(f'wine: the shell could not start the tool (status {code}); running it through a pipe')
+            return None
+        return code
+    except BaseException:
+        tool.kill()
+        raise
+    finally:
+        tool.cleanup()
 
 
 def free_bytes(path):
@@ -239,6 +302,8 @@ class Check(Step):
         except ValueError:
             raise InstallError('check.host_probe_failed', code=r.returncode) from None
         ctx.reporter.log(f'host: {r.stdout.strip()}')
+        if ctx.wine:   # MP4: under Wine or Proton, which build and how much memory (issue #11)
+            ctx.reporter.log(f'wine: {json.dumps(ctx.wine)}')
         if not host['x86_64_v3']:
             raise InstallError('check.cpu_no_avx2')
         if not host['loader']:

@@ -25,8 +25,15 @@ DAMAGE_TEXT = re.compile(r'hash mismatch|hash-table mismatch|FS header hash|IVFC
                          r'out of bounds|Section bounds|\(FAIL\)')
 DAMAGE = re.compile(rf'^\w*Error: (.*(?:{DAMAGE_TEXT.pattern}).*)$', re.M)
 
-# Runs a tools/ script by path with its folder first on sys.path (installer/steps.py run_tool).
-RUN_SCRIPT = ('import os, runpy, sys; p = sys.argv[1]; sys.path.insert(0, os.path.dirname(p)); sys.argv = sys.argv[1:]; '
+# Runs a tools/ script by path with its folder first on sys.path (installer/steps.py run_tool). MP4: under Wine the
+# setup starts the tool through /bin/sh and gets no handle for it, so the tool writes its process id to the file
+# MP4_TOOL_PID_FILE names (installer/wine.py start_tool).
+RUN_SCRIPT = ('import os, runpy, sys\n'
+              "f = os.environ.pop('MP4_TOOL_PID_FILE', None)\n"
+              'if f:\n'
+              "    with open(f + '.tmp', 'w') as o: o.write(str(os.getpid()))\n"
+              "    os.replace(f + '.tmp', f)\n"
+              'p = sys.argv[1]; sys.path.insert(0, os.path.dirname(p)); sys.argv = sys.argv[1:]; '
               "runpy.run_path(p, run_name='__main__')")
 
 

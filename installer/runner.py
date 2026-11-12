@@ -19,6 +19,7 @@ import datetime
 import traceback
 
 from . import state as statefile
+from . import wine
 
 
 class InstallError(Exception):
@@ -59,6 +60,7 @@ class Context:
         self.verify = verify
         self.mode = 'install' if state is None else 'resume' if state.get('release') == layout.release else 'update'
         self.keys, self.runs, self.reasons, self.steps, self.forced = {}, {}, {}, [], set()
+        self.wine = wine.info()   # MP4: None on Windows; under Wine or Proton what the log records (installer/wine.py)
 
     def record(self, step_id):
         return self.state['steps'].get(step_id)

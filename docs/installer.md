@@ -87,6 +87,13 @@ python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR
   Windows display language, switchable in the window; every sentence is an id in `installer/text/<en|ru>.json`. A
   folder with `mp4-install.json` needs only the folder. `--selftest [--shots DIR]` builds every screen in both
   languages and closes itself.
+- Under Wine or Proton (`installer/wine.py`): the check logs the Wine build, the Linux kernel, the host's memory and a
+  fixed list of Proton variables (`wine: {...}`). Lift, compile and prepare start their tool through `/bin/sh`, its
+  output appended to `<step>-<tool>.log` by the shell, so Wine's own messages (written to the Linux stderr, which a
+  Windows pipe never sees) land in that log too; the tool tells its Windows process id through a file, the setup
+  waits on that process and reads the log as it grows. When `/bin/sh` or the Wine loader is not there, the tool runs
+  through the pipe as on Windows. Every tool runs with `-X faulthandler`, so a crash in native code leaves its Python
+  stack in the log. Issue #11: before this, `gen.py` under Proton left an empty log and only exit code 0x80000100.
 - `tests/installer_test.py`: bookkeeping with fake steps.
 - Dev mode (a repository checkout, no `python/python.exe`): the Python that runs the module runs the tools, so use
   one with numpy, lz4 and cryptography (`.venv-win`); `toolchain/llvm-mingw-*` and `toolchain/deps-mingw` when they
