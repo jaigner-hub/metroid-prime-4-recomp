@@ -5,7 +5,8 @@ Supports NCA3, key-area or common-ticket AES-CTR, and hierarchical SHA-256 PFS0.
 Keys stay in memory. No RomFS extraction, executable launch, or network calls.
 
 Copied unchanged from fe3h-pc-recomp tools/extract_exefs.py @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026
-Jeff Aigner), apart from this header. That file is adapted from MacNativeGames games/totk/scripts/extract_exefs.py @ b75be8cfa704df3701e86130c8ced268e79d6b11 (MIT,
+Jeff Aigner), apart from this header and one MP4 change: container_entries() clips the XCI root table's entries to
+the file, so a trimmed XCI opens (issue #11). That file is adapted from MacNativeGames games/totk/scripts/extract_exefs.py @ b75be8cfa704df3701e86130c8ced268e79d6b11 (MIT,
 Copyright (c) 2026 MacNativeGames contributors), as vendored unchanged by totk-pc-recomp tools/vendor/macnativegames/
 @ c944f9f94520874f2a669add30dd08d29ee9f7b5. Changes: program_nca() takes the title id from the package instead of
 TotK's (optionally checked with --title-id); the PFS0 section reader is a function, read_pfs0_section(), so the Meta
@@ -38,12 +39,13 @@ def read_at(f, offset, length):
     return data
 
 
-def hfs(f, offset, bound):
-    return partition_entries(f, offset, bound, b'HFS0', 64)
+def hfs(f, offset, bound, clip=False):
+    return partition_entries(f, offset, bound, b'HFS0', 64, clip)
 
 
-def partition_entries(f, offset, bound, magic=b'PFS0', stride=24):
-    """Read a bounded PFS0/HFS0 table without loading its file payloads."""
+def partition_entries(f, offset, bound, magic=b'PFS0', stride=24, clip=False):
+    """Read a bounded PFS0/HFS0 table without loading its file payloads. clip: an entry that starts inside the bound but
+    ends past it is cut at the bound instead of rejected (the XCI root table of a trimmed dump, see container_entries)."""
     require(bound >= 16, 'Truncated partition header')
     hdr = read_at(f, offset, 16)
     require(hdr[:4] == magic, f'Expected {magic.decode()}')
@@ -64,6 +66,8 @@ def partition_entries(f, offset, bound, magic=b'PFS0', stride=24):
         require(name not in ('', '.', '..') and '/' not in name and '\\' not in name, 'Unsafe partition filename')
         require(name not in names, 'Duplicate partition filename')
         names.add(name)
+        if clip and size + off <= bound:
+            length = min(length, bound - size - off)
         require(size + off + length <= bound, 'Partition entry out of bounds')
         entries.append((name, offset + size + off, length))
     end = offset + size
@@ -78,7 +82,10 @@ def container_entries(f, size):
         return 'nsp', partition_entries(f, 0, size)
     require(size >= 0x138 and read_at(f, 0x100, 4) == b'HEAD', 'Expected an XCI or NSP (PFS0) game file')
     root = struct.unpack('<Q', read_at(f, 0x130, 8))[0]
-    partitions = hfs(f, root, size - root)
+    # A trimmed XCI (the common dump format) ends at the last file of the secure partition, while the root table still
+    # counts the partition's trailing padding (512 bytes in this game's cartridge image). Clip the root entries to the
+    # file; the secure partition's own entries are then checked strictly, so a file that is really cut short still fails.
+    partitions = hfs(f, root, size - root, clip=True)
     secure = [e for e in partitions if e[0] == 'secure']
     require(len(secure) == 1, 'Expected one XCI secure partition')
     return 'xci', hfs(f, secure[0][1], secure[0][2])

@@ -8,6 +8,7 @@ Run: python tests/installer_test.py
 import io
 import json
 import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -320,6 +321,43 @@ class EventsTest(unittest.TestCase):
             used |= set(re.findall(r"warning\('([a-z_.]+)'", path.read_text()))
             used |= {f'phase.{s}.{p}' for s, p in re.findall(r"progress\('(\w+)', '(\w+)'[,)]", path.read_text())}
         self.assertEqual(sorted(i for i in used if i not in catalog), [])
+
+
+def hfs0(files):
+    """An HFS0 table and payload of [(name, bytes, padding)]: padding counts in an entry's length but is not stored."""
+    strings, table, payload, at = b'', b'', b'', 0
+    for name, data, padding in files:
+        table += struct.pack('<QQII8x32s', at, len(data) + padding, len(strings), 0x200, bytes(32))
+        strings += name.encode() + b'\0'
+        payload += data + bytes(padding)
+        at += len(data) + padding
+    return struct.pack('<4sII4x', b'HFS0', len(files), len(strings)) + table + strings, payload
+
+
+class XciTrim(unittest.TestCase):
+    """MP4 addition (issue #11): a trimmed XCI ends at the secure partition's last file, while the root table still
+    counts the partition's trailing padding; it has to open, and a file cut inside that last file must not."""
+
+    def xci(self, trim):
+        secure_hdr, secure_data = hfs0([('a.nca', b'A' * 0x400, 0), ('b.nca', b'B' * 0x200, 0)])
+        secure = secure_hdr + secure_data
+        root_hdr, _ = hfs0([('secure', secure, 0x200)])
+        root = 0x200
+        image = bytearray(0x200)
+        image[0x100:0x104] = b'HEAD'
+        image[0x130:0x138] = struct.pack('<Q', root)
+        image += root_hdr + secure + bytes(0x200)
+        return io.BytesIO(bytes(image[:len(image) - trim]))
+
+    def test_full_and_trimmed_open_truncated_fails(self):
+        from extract_exefs import container_entries
+        for trim in (0, 0x200):
+            f = self.xci(trim)
+            kind, entries = container_entries(f, len(f.getvalue()))
+            self.assertEqual((kind, [(n, l) for n, _, l in entries]), ('xci', [('a.nca', 0x400), ('b.nca', 0x200)]))
+        f = self.xci(0x201)
+        with self.assertRaisesRegex(ValueError, 'Partition entry out of bounds'):
+            container_entries(f, len(f.getvalue()))
 
 
 if __name__ == '__main__':
