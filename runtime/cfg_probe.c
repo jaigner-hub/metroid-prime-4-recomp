@@ -1,6 +1,7 @@
 // From fe3h-pc-recomp runtime/cfg_probe.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only.
 // From totk-pc-recomp runtime/cfg_probe.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // --probe-cfg: mp4.ini parsing, the environment override and a missing file (cfg.c). Needs no game files.
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -263,6 +264,29 @@ int probe_cfg(void) {
     CHECK((int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768, "mouse: clamped to the unit circle");
     input_mouse_stick(30, 0, 1.0 / 60, 0, st);
     CHECK(st[0] == 0 && st[1] == 0, "mouse: sensitivity 0 is off");
+    {
+        double gy[3];
+        input_mouse_gyro(100, 0, 0.016, 1, gy);
+        CHECK(fabs(gy[2] + 100 * MOUSE_GYRO_RAD / 0.016) < 1e-9 && gy[0] == 0 && gy[1] == 0,
+              "mouse gyro: right is a clockwise yaw (-z) of MOUSE_GYRO_RAD per count");
+        input_mouse_gyro(0, -50, 0.016, 2, gy);
+        CHECK(fabs(gy[0] - 100 * MOUSE_GYRO_RAD / 0.016) < 1e-9 && gy[2] == 0, "mouse gyro: up tips the top edge up (+x), sens scales");
+        input_mouse_gyro(5000, 0, 0.004, 1, gy);
+        CHECK(gy[2] < -1000, "mouse gyro: a flick is not clamped");
+        MotionFusion *m = motion_new();
+        double acc[3], flat[3] = {0, 0, -1}, w[3] = {1.0, 0, 0};
+        motion_gravity(m, acc);
+        CHECK(acc[2] == -1, "mouse gyro: gravity reads face up before the first sample");
+        uint64_t t = 1000000000ull;
+        motion_feed(m, flat, w, t);
+        for (int i = 0; i < 100; i++) {   // pitch up 0.4 rad with the gravity fed back: no pull toward level
+            motion_gravity(m, acc);
+            motion_feed(m, acc, w, t += 4000000);
+        }
+        motion_gravity(m, acc);
+        CHECK(fabs(acc[1] + sin(0.4)) < 1e-3 && fabs(acc[2] + cos(0.4)) < 1e-3,
+              "mouse gyro: fed back gravity keeps the integrated pitch");
+    }
     input_pad_stick(3000, -2000, 0.15f, st);
     CHECK(st[0] == 0 && st[1] == 0, "pad stick: an 11% drift inside a 15% dead zone reads centred");
     input_pad_stick(4000, -3000, 0, st);
@@ -303,6 +327,23 @@ int probe_cfg(void) {
               input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_ZL] = 1}, PAD_LAYOUT_NINTENDO) == 1ull << B_ZL,
           "bind: pad:rpaddle1 adds a back paddle, pad:default keeps the trigger");
     input_map_reset();
+    {   // MP4_MOUSE_AIM=gyro picks the motion-controls key table: left click fires (A), right click is the missile (R)
+        const char *keep = cfg_get("MP4_MOUSE_AIM");
+        char *k = keep ? _strdup(keep) : NULL;
+        cfg_set("MP4_MOUSE_AIM", "gyro");
+        input_map_configure();
+        CHECK(input_map_buttons((uint8_t[KEY_COUNT]){[KEY_MOUSE_L] = 1}) == 1ull << B_A &&
+                  input_map_buttons((uint8_t[KEY_COUNT]){[KEY_MOUSE_R] = 1}) == 1ull << B_R &&
+                  input_map_buttons((uint8_t[KEY_COUNT]){[KEY_SPACE] = 1}) == 1ull << B_B &&
+                  input_map_buttons((uint8_t[KEY_COUNT]){[KEY_LCTRL] = 1}) == 1ull << B_Y,
+              "gyro keys: left click A, right click R, Space B, Ctrl Y");
+        cfg_set("MP4_MOUSE_AIM", "stick");
+        input_map_configure();
+        CHECK(input_map_buttons((uint8_t[KEY_COUNT]){[KEY_MOUSE_L] = 1}) == 1ull << B_Y, "stick keys: left click stays Y");
+        cfg_set("MP4_MOUSE_AIM", k ? k : "");
+        free(k);
+        input_map_configure();
+    }
     // Bind lines for stick directions and default parts; the remapping rows' edits (input_map.c)
     memset(dn, 0, sizeof dn);
     dn[KEY_I] = 1;

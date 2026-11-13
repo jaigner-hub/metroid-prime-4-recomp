@@ -24,6 +24,17 @@
     {KEY_1, B_LEFT}, {KEY_2, B_UP}, {KEY_3, B_RIGHT}, {KEY_4, B_DOWN}, \
     {KEY_TAB, B_PLUS}, {KEY_M, B_MINUS}
 
+// MP4_MOUSE_AIM=gyro: the mouse aims through the game's motion controls, whose layout fires with A, jumps with B, scans
+// with X, morphs with Y and launches a missile with R. Left click fires, right click is the missile, Space jumps.
+#define GYRO_KEYS \
+    {KEY_W, B_SL_UP}, {KEY_A, B_SL_LEFT}, {KEY_S, B_SL_DOWN}, {KEY_D, B_SL_RIGHT},                  /* move */ \
+    {KEY_UP, B_SR_UP}, {KEY_LEFT, B_SR_LEFT}, {KEY_DOWN, B_SR_DOWN}, {KEY_RIGHT, B_SR_RIGHT}, \
+    {KEY_MOUSE_L, B_A}, {KEY_MOUSE_R, B_R}, {KEY_SPACE, B_B}, {KEY_E, B_X}, {KEY_LCTRL, B_Y}, {KEY_C, B_Y}, \
+    {KEY_Q, B_L}, {KEY_R, B_R}, {KEY_Z, B_ZL}, {KEY_F, B_ZR}, {KEY_X, B_ZR}, \
+    {KEY_LSHIFT, B_STICK_L}, {KEY_MOUSE_M, B_STICK_R}, \
+    {KEY_1, B_LEFT}, {KEY_2, B_UP}, {KEY_3, B_RIGHT}, {KEY_4, B_DOWN}, \
+    {KEY_TAB, B_PLUS}, {KEY_M, B_MINUS}
+
 // By position: south is Switch B, east A, west Y, north X (Nintendo layout); the Xbox layout swaps A with B and X with Y
 // (south A, as the Xbox labels; cross A on a PlayStation pad). The triggers are ZL and ZR.
 #define DEFAULT_PADS(south, east, west, north) \
@@ -33,11 +44,16 @@
     {PAD_ZR, B_ZR}
 #define NINTENDO_PADS DEFAULT_PADS(B_B, B_A, B_Y, B_X)
 #define XBOX_PADS DEFAULT_PADS(B_A, B_B, B_X, B_Y)
-enum { DEFAULT_KEY_COUNT = 26, DEFAULT_PAD_COUNT = 16 };
+enum { DEFAULT_KEY_COUNT = 26, GYRO_KEY_COUNT = 27, DEFAULT_PAD_COUNT = 16 };
 _Static_assert(sizeof (Binding[]){DEFAULT_KEYS} / sizeof (Binding) == DEFAULT_KEY_COUNT, "DEFAULT_KEY_COUNT");
+_Static_assert(sizeof (Binding[]){GYRO_KEYS} / sizeof (Binding) == GYRO_KEY_COUNT, "GYRO_KEY_COUNT");
+_Static_assert(GYRO_KEY_COUNT <= INPUT_BINDING_MAX, "GYRO_KEYS fits");
 
-static const InputMap defaults = {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
-                                  {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}};
+static const InputMap defaults_stick = {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
+                                        {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}};
+static const InputMap defaults_gyro = {{GYRO_KEYS}, GYRO_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
+                                       {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}};
+static const InputMap *defaults = &defaults_stick;   // input_map_configure picks it from MP4_MOUSE_AIM
 InputMap input_map = {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
                       {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT}};
 
@@ -65,7 +81,7 @@ const char *input_action_name(int action) { return action >= 0 && action < ACTIO
 const char *input_key_name(int key) { return key > KEY_NONE && key < KEY_COUNT ? key_names[key] : NULL; }
 const char *input_pad_name(int pad) { return pad > PAD_NONE && pad < PAD_COUNT ? pad_names[pad] : NULL; }
 
-void input_map_reset(void) { input_map = defaults; }
+void input_map_reset(void) { input_map = *defaults; }
 
 static int key_id(const char *name) {
     for (int k = KEY_A; k < KEY_COUNT; k++)
@@ -154,12 +170,12 @@ int input_map_bind(const char *button, const char *list) {
         return 0;
     }
     uint8_t list_k[INPUT_BINDING_MAX];
-    int n = key_def ? input_map_keys_of(&defaults, action, list_k, INPUT_BINDING_MAX) : 0;
+    int n = key_def ? input_map_keys_of(defaults, action, list_k, INPUT_BINDING_MAX) : 0;
     for (int i = 0; i < nk && n < INPUT_BINDING_MAX; i++) list_k[n++] = keys[i];
     keys_put(&input_map, action, list_k, n);
     for (int l = 0; l < PAD_LAYOUT_COUNT; l++) {   // a bind line names physical buttons: the same in every layout
         uint8_t list_p[INPUT_PAD_BINDING_MAX];
-        int c = pad_def ? input_map_pads_of(&defaults, action, l, list_p, INPUT_PAD_BINDING_MAX) : 0;
+        int c = pad_def ? input_map_pads_of(defaults, action, l, list_p, INPUT_PAD_BINDING_MAX) : 0;
         for (int i = 0; i < np && c < INPUT_PAD_BINDING_MAX; i++) list_p[c++] = pads[i];
         pads_put(&input_map, l, action, list_p, c);
     }
@@ -167,6 +183,8 @@ int input_map_bind(const char *button, const char *list) {
 }
 
 void input_map_configure(void) {
+    const char *aim = cfg_get("MP4_MOUSE_AIM");
+    defaults = aim && !strcmp(aim, "gyro") ? &defaults_gyro : &defaults_stick;
     input_map_reset();
     for (int a = 0; a < ACTION_COUNT; a++) {
         char var[32];
@@ -210,7 +228,7 @@ static int pads_at_defaults(const InputMap *m, int layout) {
     for (int a = 0; a < B_SL_LEFT; a++) {
         uint8_t p[INPUT_PAD_BINDING_MAX], dp[INPUT_PAD_BINDING_MAX];
         int np = input_map_pads_of(m, a, layout, p, INPUT_PAD_BINDING_MAX);
-        if (!same_set(p, np, dp, input_map_pads_of(&defaults, a, layout, dp, INPUT_PAD_BINDING_MAX))) return 0;
+        if (!same_set(p, np, dp, input_map_pads_of(defaults, a, layout, dp, INPUT_PAD_BINDING_MAX))) return 0;
     }
     return 1;
 }
@@ -232,8 +250,8 @@ int input_map_set_pad(InputMap *m, int action, int layout, int pad) {
     uint8_t p = (uint8_t)pad;
     pads_put(m, layout, action, &p, pad != PAD_NONE);
     if (pads_at_defaults(m, layout)) {   // put back as it was: the layout setting moves the face buttons again
-        memcpy(m->pads, defaults.pads, sizeof m->pads);
-        memcpy(m->npads, defaults.npads, sizeof m->npads);
+        memcpy(m->pads, defaults->pads, sizeof m->pads);
+        memcpy(m->npads, defaults->npads, sizeof m->npads);
         return other;
     }
     int pin[6] = {B_A, B_B, B_X, B_Y, action, other}, npin = other >= 0 ? 6 : 5;
@@ -260,12 +278,12 @@ static int same_set(const uint8_t *a, int na, const uint8_t *b, int nb) {
 void input_map_line(const InputMap *m, int action, char *out, size_t n) {
     uint8_t k[INPUT_BINDING_MAX], dk[INPUT_BINDING_MAX];
     int nk = input_map_keys_of(m, action, k, INPUT_BINDING_MAX);
-    int key_def = same_set(k, nk, dk, input_map_keys_of(&defaults, action, dk, INPUT_BINDING_MAX));
+    int key_def = same_set(k, nk, dk, input_map_keys_of(defaults, action, dk, INPUT_BINDING_MAX));
     int pad_def = 1;
     for (int l = 0; l < PAD_LAYOUT_COUNT; l++) {
         uint8_t p[INPUT_PAD_BINDING_MAX], dp[INPUT_PAD_BINDING_MAX];
         int np = input_map_pads_of(m, action, l, p, INPUT_PAD_BINDING_MAX);
-        pad_def &= same_set(p, np, dp, input_map_pads_of(&defaults, action, l, dp, INPUT_PAD_BINDING_MAX));
+        pad_def &= same_set(p, np, dp, input_map_pads_of(defaults, action, l, dp, INPUT_PAD_BINDING_MAX));
     }
     out[0] = 0;
     if (key_def && pad_def) return;
@@ -325,6 +343,14 @@ void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, int32_t 
     if (len > STICK_MAX) { x *= STICK_MAX / len; y *= STICK_MAX / len; }
     out[0] = (int32_t)lrint(x);
     out[1] = (int32_t)lrint(y);
+}
+
+void input_mouse_gyro(int32_t dx, int32_t dy, double dt_s, float sens, double out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!(dt_s > 0) || !(sens > 0)) return;
+    double k = MOUSE_GYRO_RAD * (double)sens / dt_s;
+    out[0] = -dy * k;
+    out[2] = -dx * k;
 }
 
 void input_pad_stick(int32_t x, int32_t y, float dead, int32_t out[2]) {

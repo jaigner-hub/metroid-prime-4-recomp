@@ -371,6 +371,7 @@ uint32_t input_key_char(int key) {
 
 // ---- mouse camera: raw motion accumulated by the window thread, one stick sample per presented frame
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
+static volatile LONG gyro_dx, gyro_dy;     // raw counts since the gamepad thread's last tick (mouse_gyro_take)
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
 // Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
@@ -444,6 +445,8 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
             ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
             InterlockedAdd(&mouse_dx, ri.data.mouse.lLastX);
             InterlockedAdd(&mouse_dy, ri.data.mouse.lLastY);
+            InterlockedAdd(&gyro_dx, ri.data.mouse.lLastX);
+            InterlockedAdd(&gyro_dy, ri.data.mouse.lLastY);
         }
         break;   // DefWindowProc must see WM_INPUT for cleanup
     }
@@ -486,6 +489,21 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
 
 static int key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+// MP4_MOUSE_AIM=gyro (live): the mouse turns the six-axis sensor instead of the right stick, so the game's motion aim
+// sees it (unclamped, no stick acceleration). Only while the game runs the sensor and motion is on (MP4_MOTION);
+// otherwise the mouse stays the right stick.
+static int mouse_aim_gyro(void) {
+    static int on = -1;
+    static unsigned seen;
+    unsigned v = cfg_version();
+    if (on < 0 || v != seen) {
+        seen = v;
+        const char *s = cfg_get("MP4_MOUSE_AIM");
+        on = s && !strcmp(s, "gyro");
+    }
+    return on && InterlockedCompareExchange(&motion_wanted, 0, 0) && input_motion_enabled();
+}
+
 // The mouse camera as a right-stick sample, held for the whole presented frame. Under `lock`.
 static void mouse_camera(int32_t out[2]) {
     static uint64_t frame = ~0ull;
@@ -494,7 +512,7 @@ static void mouse_camera(int32_t out[2]) {
     LARGE_INTEGER now, f;
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&f);
-    if (!cur_captured) {
+    if (!cur_captured || mouse_aim_gyro()) {   // gyro aim: the gamepad thread takes the motion (mouse_gyro_take)
         InterlockedExchange(&mouse_dx, 0);
         InterlockedExchange(&mouse_dy, 0);
         held[0] = held[1] = 0;
@@ -604,6 +622,8 @@ static void binds_refresh(void) {
         const char *s = cfg_get(var);
         len += (size_t)snprintf(now + len, len < sizeof now ? sizeof now - len : 0, "%s\n", s ? s : "");
     }
+    const char *aim = cfg_get("MP4_MOUSE_AIM");   // picks the default key table (input_map_configure)
+    len += (size_t)snprintf(now + len, len < sizeof now ? sizeof now - len : 0, "%s\n", aim ? aim : "");
     if (!strcmp(now, binds_applied)) return;
     memcpy(binds_applied, now, sizeof now);
     input_map_configure();
@@ -938,6 +958,35 @@ int input_motion_enabled(void) {
     return on;
 }
 
+// The mouse's gyro rate for this gamepad thread tick, 1 while the gyro mouse aim is on and the cursor captured. The
+// game reads only the newest six-axis sample, once a frame: a rate from one 4 ms tick would drop the other ticks'
+// motion if the game multiplies it by its frame time. The rate is the mean over the last MOUSE_GYRO_TICKS ticks
+// (16 ms) instead, whose integral over time is still every count the mouse moved, so a reader of the rate and a
+// reader of the integrated angle both turn as far as the mouse did. Gamepad thread only.
+enum { MOUSE_GYRO_TICKS = 4 };
+static int mouse_gyro_take(double out[3]) {
+    static int32_t rx[MOUSE_GYRO_TICKS], ry[MOUSE_GYRO_TICKS];
+    static double rdt[MOUSE_GYRO_TICKS];
+    static int at;
+    static uint64_t last;
+    uint64_t now = kern_now_ns();
+    double dt = last && now > last ? (double)(now - last) / 1e9 : 0.004;
+    if (dt > 0.05) dt = 0.004;
+    last = now;
+    int32_t dx = InterlockedExchange(&gyro_dx, 0), dy = InterlockedExchange(&gyro_dy, 0);
+    if (!cur_captured || !mouse_aim_gyro()) {
+        memset(rx, 0, sizeof rx), memset(ry, 0, sizeof ry), memset(rdt, 0, sizeof rdt);
+        return 0;
+    }
+    rx[at] = dx, ry[at] = dy, rdt[at] = dt;
+    at = (at + 1) % MOUSE_GYRO_TICKS;
+    int32_t sx = 0, sy = 0;
+    double sdt = 0;
+    for (int i = 0; i < MOUSE_GYRO_TICKS; i++) sx += rx[i], sy += ry[i], sdt += rdt[i];
+    input_mouse_gyro(sx, sy, sdt, mouse_sens_get(), out);
+    return 1;
+}
+
 // The gamepad thread, 250 Hz, the only caller of SDL after start(): a scan for a gamepad (every RESCAN_MS while none
 // is open), the update (reports read, rumble expiry), the snapshot for the game's threads (snap_publish), the rumble
 // they asked for, and, once the game started the six-axis sensor (input_motion_start), the newest gyro and
@@ -983,9 +1032,14 @@ static DWORD WINAPI pad_main(void *arg) {
                    SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
             slow_note("the sensor read (gamepad thread)", t0);
         }
-        if (!have || !input_motion_enabled()) continue;
-        double acc[3], gyro[3];
-        input_motion_axes(a, g, acc, gyro);
+        double acc[3], gyro[3] = {0, 0, 0}, mg[3];
+        if (have) input_motion_axes(a, g, acc, gyro);
+        int mouse = mouse_gyro_take(mg);   // added to a real gyro; alone, held still in the estimated orientation
+        if (!(have || mouse) || !input_motion_enabled()) continue;
+        if (mouse) {
+            for (int j = 0; j < 3; j++) gyro[j] += mg[j];
+            if (!have) motion_gravity(motion_global(), acc);
+        }
         motion_feed(motion_global(), acc, gyro, kern_now_ns());
     }
     return 0;

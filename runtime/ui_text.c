@@ -115,6 +115,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_STICK_DEADZONE_DESC] = "How far a gamepad stick moves before the game sees it. Raise it if the character or the camera moves on its own.",
     [UI_MENU_MOUSE_SENS] = "Mouse camera sensitivity",
     [UI_MENU_MOUSE_SENS_DESC] = "How fast the mouse turns the camera.",
+    [UI_MENU_MOUSE_AIM] = "Mouse aim",
+    [UI_MENU_MOUSE_AIM_DESC] = "Gyro: the mouse aims like a motion controller, as fast as the hand moves; turn on Motion "
+                               "controls in the game's options. Left click shoots, right click fires a missile, Space jumps. "
+                               "Stick: the mouse moves the right stick.",
+    [UI_MENU_MOUSE_AIM_STICK] = "Stick", [UI_MENU_MOUSE_AIM_GYRO] = "Gyro",
 
     [UI_BINDS_HELP] = "Select a cell and press A or Enter, then the key, mouse button or controller button. Delete or "
                       "X clears a cell. A key in use moves here; a controller button swaps with the one it replaces.",
@@ -351,6 +356,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_STICK_DEADZONE_DESC] = "Насколько нужно отклонить стик геймпада, чтобы игра это заметила. Увеличьте, если персонаж или камера двигаются сами.",
     [UI_MENU_MOUSE_SENS] = "Чувствительность мыши",
     [UI_MENU_MOUSE_SENS_DESC] = "Как быстро мышь поворачивает камеру.",
+    [UI_MENU_MOUSE_AIM] = "Прицел мышью",
+    [UI_MENU_MOUSE_AIM_DESC] = "Гироскоп: мышь целится как контроллер с датчиком движения, так быстро, как движется рука; "
+                               "включите управление движением в настройках игры. Левая кнопка стреляет, правая выпускает "
+                               "ракету, пробел прыжок. Стик: мышь двигает правый стик.",
+    [UI_MENU_MOUSE_AIM_STICK] = "Стик", [UI_MENU_MOUSE_AIM_GYRO] = "Гироскоп",
 
     [UI_BINDS_HELP] = "Выберите ячейку и нажмите A или Enter, затем клавишу, кнопку мыши или кнопку контроллера. "
                       "Delete или X очищает ячейку. Занятая клавиша переходит сюда; кнопка контроллера меняется "

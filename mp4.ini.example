@@ -42,3 +42,9 @@
 # pad_layout = auto
 # Rumble strength in percent, and off with 0.
 # rumble_strength = 80
+# Mouse aim: stick (the mouse moves the right stick) or gyro (the mouse turns the motion sensor; turn on "Motion
+# controls" in the game's options). Gyro also changes the default keys: left click shoots (A), right click fires a
+# missile (R), Space jumps (B), E scans (X), Ctrl or C morphs (Y).
+# mouse_aim = stick
+# Mouse sensitivity, 0 to 10; 0 turns the mouse camera off.
+# mouse_sens = 1

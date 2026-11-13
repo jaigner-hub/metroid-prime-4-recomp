@@ -506,6 +506,21 @@ the null decoder). No host AAC decoder needed.
     every heap's usage and budget at the first out-of-memory creation, so a player's log shows what fills the card.
   - Left: the light volumes are sparse on the console (only mapped tiles backed); full images cost 2.6 GB in the first
     area. Sparse residency would cut that on every card.
+- Mouse aim through the motion sensor (issue #17, 2026-11-13). The mouse camera fed the right stick
+  (`input_map.c` input_mouse_stick): a flick saturates at full deflection and the game's stick turn curve applies on
+  top, where PrimeHack-style aim turns by the hand's motion. The game reads a six-axis sensor (handle 0x20003, one
+  state per call) and, with "Motion controls" on in its own options, turns the view from the gyro; with them off a
+  constant injected yaw or pitch moved nothing in a 5 s pair of shots. `MP4_MOUSE_AIM=gyro` (live, also a menu row)
+  feeds raw mouse counts as a gyro rate on the gamepad thread (`input_win.c` mouse_gyro_take; MOUSE_GYRO_RAD = 0.0012
+  rad per count at sensitivity 1, right is -z, up is +x for a controller lying face up), added to a real pad's gyro.
+  - The game reads only the newest sample once a frame, so the rate is the mean over the last four 4 ms ticks: its
+    integral over time is still every count, for a reader of the rate or of the integrated angle.
+  - With no pad, the accelerometer reads the fusion's own down (`motion_fusion.c` motion_gravity): a fixed face-up
+    reading would pull pitch back to level at the correction's 0.5/s.
+  - Gyro mode has its own default keys for the motion layout (A fire, R missile, B jump, X scan, Y morph): left
+    click, right click, Space, E, Ctrl/C. `binds_refresh` includes the mode, so switching it swaps the tables live.
+  - Off by default, as the mouse does nothing in gyro mode until the game's own motion option is on. Played and
+    confirmed by the user on the first area.
 
 ## Shared core
 

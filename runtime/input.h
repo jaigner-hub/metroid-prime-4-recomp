@@ -83,3 +83,6 @@ MotionFusion *motion_global(void);   // the gamepad's, fed by input_win.c
 void motion_feed(MotionFusion *m, const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);
 int motion_read(MotionFusion *m, MotionState *out, int max, uint64_t now_ns);   // newest first; 0 = none in 200 ms
 void motion_restart(MotionFusion *m);   // angle and direction start over at the next sample
+// The acceleration a controller held still in the current orientation estimate reads (G, as gravity reads; lying face
+// up before the first sample): fed back with a synthetic gyro, the gravity correction has nothing to pull.
+void motion_gravity(MotionFusion *m, double acc_g[3]);

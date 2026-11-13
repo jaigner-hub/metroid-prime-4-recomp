@@ -98,6 +98,12 @@ void input_map_stick(const uint8_t down[KEY_COUNT], int stick, int32_t out[2]);
 // Mouse motion in raw counts over dt_s seconds to right-stick deflection: full deflection at 3000 / sens counts/s.
 // Clamped to the unit circle, up (negative dy) is +y.
 void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, int32_t out[2]);
+// Mouse motion in raw counts over dt_s seconds to a gyro rate in the Switch controller frame (rad/s; x to the right,
+// y toward the top edge, z out of the face), as if the mouse turned a controller lying face up: right is a turn
+// clockwise seen from above (-z), up (negative dy) tips the top edge up (+x). MOUSE_GYRO_RAD radians per count at
+// sens 1; unclamped, so a flick turns as far as the hand moved.
+#define MOUSE_GYRO_RAD 0.0012
+void input_mouse_gyro(int32_t dx, int32_t dy, double dt_s, float sens, double out[3]);
 // A gamepad stick (x, y in -32768..32767, up is +y) through a round dead zone of `dead` (fraction of full deflection,
 // 0..0.5): inside the circle the stick reads 0, and the rest of the travel is scaled to start at 0 at the edge, so a
 // drifting stick rests at 0 and full deflection still reaches full. The result stays inside the unit square.

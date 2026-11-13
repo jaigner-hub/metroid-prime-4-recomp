@@ -81,6 +81,15 @@ offers 30, 90, 120, 144 and the monitor's refresh rate (`display`). Above 60 is 
   about 80 in the heaviest, where the CPU side limits it; with `display` on a 240 Hz monitor the light views reach
   200 fps.
 
+## Mouse aim
+
+"Mouse aim" in the Controls tab (`mouse_aim`) chooses how the mouse aims. `stick`, the default, moves the right stick,
+so the game's turn speed and acceleration apply. `gyro` turns the controller's motion sensor instead, as PrimeHack does
+for the older Prime games: the view follows the hand as fast as it moves, with no top speed. For gyro, turn on "Motion
+controls" in the game's own options. It also brings keys for the game's motion layout: left click shoots, right click
+fires a missile, Space jumps, E scans, Ctrl or C morphs. "Mouse camera sensitivity" (`mouse_sens`) sets the speed in
+both modes, and the Controls tab can remap every key.
+
 ## What you need to build from source
 
 Windows 10 or later, a Vulkan 1.3 GPU, and the toolchain totk-pc-recomp's `docs/building.md` describes: MSYS2

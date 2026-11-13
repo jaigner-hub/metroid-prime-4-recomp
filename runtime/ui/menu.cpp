@@ -593,6 +593,8 @@ static void tab_controls(float scale) {
     opt_slider("MP4_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
     opt_toggle("MP4_RUMBLE_TRIGGERS", UI_MENU_RUMBLE_TRIGGERS, UI_MENU_RUMBLE_TRIGGERS_DESC);
     opt_slider("MP4_STICK_DEADZONE", UI_MENU_STICK_DEADZONE, 0, 50, UI_MENU_STICK_DEADZONE_DESC, 1, "%.0f %%");
+    static const UiTextId aim[] = {UI_MENU_MOUSE_AIM_STICK, UI_MENU_MOUSE_AIM_GYRO};
+    opt_choice("MP4_MOUSE_AIM", UI_MENU_MOUSE_AIM, aim, 2, UI_MENU_MOUSE_AIM_DESC);
     opt_slider("MP4_MOUSE_SENS", UI_MENU_MOUSE_SENS, 0, 10, UI_MENU_MOUSE_SENS_DESC, 0.1f, "%.1f");
     binds_rows(scale);
     opt_end();

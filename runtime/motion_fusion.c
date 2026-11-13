@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/motion_fusion.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
+// From fe3h-pc-recomp runtime/motion_fusion.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner); motion_gravity added.
 // From totk-pc-recomp runtime/motion_fusion.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 // Adapted from MacNativeGames games/totk/runtime/motion_fusion.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
 // contributors).
@@ -142,6 +142,13 @@ int motion_read(MotionFusion *m, MotionState *out, int max, uint64_t now) {
     }
     ReleaseSRWLockShared(&m->lock);
     return n;
+}
+
+void motion_gravity(MotionFusion *m, double acc[3]) {
+    AcquireSRWLockShared(&m->lock);
+    if (m->restart) acc[0] = acc[1] = 0, acc[2] = -1;
+    else for (int j = 0; j < 3; j++) acc[j] = -m->R[2][j];   // row 2 = the reference's up in controller coordinates
+    ReleaseSRWLockShared(&m->lock);
 }
 
 void motion_restart(MotionFusion *m) {
