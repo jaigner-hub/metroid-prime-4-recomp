@@ -14,6 +14,7 @@
  "phase.extract.hash_update": "Computing the checksum of the update",
  "phase.extract.exefs": "Extracting the game code",
  "phase.extract.copy": "Copying the game data",
+ "phase.extract.merge_check": "Checking the hashes of the game data",
  "phase.extract.merge": "Applying the update to the game data",
  "phase.extract.diagnose": "Finding which game file is damaged",
  "phase.extract.index": "Verifying the game data",

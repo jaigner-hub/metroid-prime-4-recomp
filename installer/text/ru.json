@@ -14,6 +14,7 @@
  "phase.extract.hash_update": "Подсчёт контрольной суммы обновления",
  "phase.extract.exefs": "Распаковка кода игры",
  "phase.extract.copy": "Копирование данных игры",
+ "phase.extract.merge_check": "Проверка хешей данных игры",
  "phase.extract.merge": "Применение обновления к данным игры",
  "phase.extract.diagnose": "Поиск повреждённого файла игры",
  "phase.extract.index": "Проверка данных игры",

@@ -215,26 +215,47 @@ def expected_update(ctx):
 
 
 class Watch(threading.Thread):
-    """Polls a measure() of bytes written while a long call runs and reports it as progress."""
+    """Polls a measure() of bytes written while a long call runs and reports it as progress.
+
+    MP4: set(first=...) names a phase without a count that shows until measure() rises above 0. hactool reads both NCAs
+    to check their hashes before it writes the first byte of the merged image, minutes in which the bar sat at 0 and
+    the setup looked hung (issue #11). The thread also ends once the main thread is gone: under Proton the main thread
+    died at a Ctrl+Break without reaching stop(), and this thread then kept the process running and logging."""
 
     def __init__(self, reporter, step):
         super().__init__(daemon=True)
         self.reporter, self.step = reporter, step
-        self.phase, self.measure, self.total = None, None, None
+        self.target = None   # [phase, measure, total, first], replaced as a whole by set()
         self.stopped = threading.Event()
 
-    def set(self, phase, measure=None, total=None):
-        self.phase, self.measure, self.total = phase, measure, total
+    def set(self, phase, measure=None, total=None, first=None):
+        self.target = target = [phase, measure, total, first]
+        if first:
+            self.reporter.progress(self.step, first, force=True)
+        else:
+            self._begin(target)
+
+    def _begin(self, target):
+        phase, _, total, _ = target
+        target[3] = None
         self.reporter.progress(self.step, phase, 0 if total else None, total, 'bytes' if total else None, force=True)
 
     def run(self):
-        while not self.stopped.wait(1.0):
-            phase, measure, total = self.phase, self.measure, self.total
+        main = threading.main_thread()
+        while not self.stopped.wait(1.0) and main.is_alive():
+            target = self.target
+            if not target:
+                continue
+            phase, measure, total, first = target
             if phase and measure:
                 try:
                     done = min(measure(), total)
                 except OSError:
                     continue
+                if first:
+                    if not done:
+                        continue
+                    self._begin(target)
                 self.reporter.progress(self.step, phase, done, total, 'bytes')
 
     def stop(self):
@@ -527,7 +548,7 @@ class Extract(Step):
                 watch.set('copy', lambda: size_of(dest.glob('update-merge-*/*.nca')), ncas)
             elif name == 'merge':
                 watch.set('merge', lambda: size_of(dest.glob('update-merge-*/result/romfs.bin')),
-                          expected['romfs']['size'])
+                          expected['romfs']['size'], first='merge_check')
             else:
                 watch.set(name)
 

@@ -457,6 +457,7 @@ class WineToolTest(unittest.TestCase):
         self.assertEqual(inherited, 'None')   # popped, so the tool's own children do not overwrite it
 
 
+
 class WineCrtTest(unittest.TestCase):
     """MP4: tools/wine_crt.py (issue #11). The thunks are the first 24 bytes of crealf and cimagf, and of creal, in
     ucrtbase under Proton 10.0-4's Wine; the patch writes only over the stub thunk, and does nothing off Wine."""
@@ -480,6 +481,76 @@ class WineCrtTest(unittest.TestCase):
     def test_nothing_happens_off_wine(self):
         self.assertEqual(self.wine_crt.patch(), [])
 
+
+
+class WatchPhaseTest(unittest.TestCase):
+    """MP4: steps.Watch, the phase without a count until the measure moves (hactool's hash check before the merge
+    writes), and its end once the main thread is gone (issue #11)."""
+
+    def watch(self, sizes):
+        events = []
+        reporter = SimpleNamespace(progress=lambda step, phase, done=None, total=None, unit=None, force=False:
+                                   events.append((phase, done)))
+        w = steps.Watch(reporter, 'extract')
+        values = iter(sizes)
+        w.set('merge', lambda: next(values), 100, first='merge_check')
+        return w, events
+
+    def test_the_first_phase_shows_until_bytes_are_written(self):
+        w, events = self.watch([0, 0, 40, 100])
+        rounds = iter([False] * 4 + [True])   # four polls, then stop(), without the one-second waits
+        w.stopped.wait = lambda timeout: next(rounds)
+        w.run()
+        self.assertEqual(events, [('merge_check', None), ('merge', 0), ('merge', 40), ('merge', 100)])
+
+    def test_it_ends_once_the_main_thread_is_gone(self):
+        w, events = self.watch([5] * 100)
+        real = steps.threading.main_thread
+        steps.threading.main_thread = lambda: SimpleNamespace(is_alive=lambda: False)
+        try:
+            w.run()   # returns at once instead of polling until stop()
+        finally:
+            steps.threading.main_thread = real
+        self.assertEqual(events, [('merge_check', None)])
+
+
+class CancelGraceTest(unittest.TestCase):
+    """MP4: guilogic.Process ends a run still going CANCEL_GRACE_SECONDS after Ctrl+Break, which then reads as
+    cancelled (issue #11)."""
+
+    def process(self):
+        from installer import guilogic
+        p = guilogic.Process.__new__(guilogic.Process)
+        state = {'code': None, 'ended': 0}
+        p.proc = SimpleNamespace(poll=lambda: state['code'], pid=1234, kill=lambda: None)
+        p.reader = SimpleNamespace(is_alive=lambda: False)
+        p.lines = guilogic.queue.Queue()
+        p.cancelled_at, p.ended_on_cancel = None, False
+
+        def end_tree():
+            state['ended'] += 1
+            state['code'] = 1   # TerminateProcess's code
+        p.end_tree = end_tree
+        return p, state, guilogic
+
+    def test_a_run_that_outlives_the_break_is_ended_and_reads_as_cancelled(self):
+        p, state, guilogic = self.process()
+        p.cancelled_at = guilogic.time.monotonic() - guilogic.CANCEL_GRACE_SECONDS - 1
+        self.assertEqual(p.poll(), 3)
+        self.assertEqual(state['ended'], 1)
+
+    def test_within_the_grace_the_run_is_left_to_end(self):
+        p, state, guilogic = self.process()
+        p.cancelled_at = guilogic.time.monotonic()
+        self.assertIsNone(p.poll())
+        self.assertEqual(state['ended'], 0)
+
+    def test_a_run_not_cancelled_is_never_ended(self):
+        p, state, _ = self.process()
+        self.assertIsNone(p.poll())
+        state['code'] = 0
+        self.assertEqual(p.poll(), 0)
+        self.assertEqual(state['ended'], 0)
 
 
 if __name__ == '__main__':

@@ -325,10 +325,16 @@ def send_break(proc, python=None):
     return r.returncode == 0
 
 
+# MP4: how long a cancelled run may take to end after Ctrl+Break before the window ends it and its tools (issue #11:
+# under Proton the setup's main thread died at the break without its cleanup, and its progress thread kept it alive).
+CANCEL_GRACE_SECONDS = 30
+
+
 class Process:
     """`python -m installer ...` with its stdout lines going to self.lines (a queue).
 
-    poll() returns the exit code once the process ended and its output is drained, else None."""
+    poll() returns the exit code once the process ended and its output is drained, else None. A run still going
+    CANCEL_GRACE_SECONDS after cancel() is ended with its tools, and then reads as cancelled (exit code 3)."""
 
     def __init__(self, command, cwd=None, helper_python=None, creationflags=None):
         self.command = command
@@ -339,6 +345,7 @@ class Process:
         self.proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, creationflags=flags)
         self.cancelled_at = None
+        self.ended_on_cancel = False
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
 
@@ -354,9 +361,23 @@ class Process:
 
     def poll(self):
         code = self.proc.poll()
+        if (code is None and self.cancelled_at is not None and not self.ended_on_cancel
+                and time.monotonic() - self.cancelled_at > CANCEL_GRACE_SECONDS):
+            self.ended_on_cancel = True
+            self.end_tree()
+            code = self.proc.poll()
         if code is not None and not self.reader.is_alive() and self.lines.empty():
-            return code
+            return 3 if self.ended_on_cancel else code
         return None
+
+    def end_tree(self):
+        """The run and every tool it started: taskkill /T (Windows, and Wine), else kill() of the run alone."""
+        try:
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.proc.pid)], capture_output=True,
+                           creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self.kill()
 
     def kill(self):
         if self.proc.poll() is None:
