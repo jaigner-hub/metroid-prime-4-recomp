@@ -64,6 +64,7 @@ import time
 from pathlib import Path
 
 import romfs_index
+import wine_crt
 from build_shaders import stale as stale_shaders
 from check_content import GENERATED_MARKER
 
@@ -73,7 +74,13 @@ ROOT = Path(__file__).resolve().parent.parent
 MAIN_ROOT = (ROOT / 'build').resolve().parent
 UCRT = Path(r'C:\msys64\ucrt64\bin')
 CLANG = UCRT / 'clang.exe'
+CLANG_ARGS = []   # MP4: arguments that go with CLANG on every command line (main(), --toolchain)
 NINJA = UCRT / 'ninja.exe'
+# MP4: under Wine (Proton 10.0 on a Steam Deck, issue #11) starting a compiler fails now and then while Ninja starts
+# many at once: "CreateProcess: GetLastError() = 731" from Ninja, "clang-23: Invalid argument" from llvm-mingw's
+# clang.exe launcher. Ninja is run again this many times; it rebuilds only what failed or never started, so a real
+# compile error fails each time and costs only its own object.
+WINE_RETRIES = 2
 SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll',
              UCRT / 'libopenh264-8.dll']   # MP4: the movies' H.264 decoder for a development build; an install gets
                                            # Cisco's DLL from the installer instead (runtime/ov_movie.c h264_lib)
@@ -257,7 +264,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',
         f'builddir = {ninja_path(out)}',
-        f'cc = {cmd_arg(CLANG.as_posix())}',
+        f'cc = {" ".join([cmd_arg(CLANG.as_posix())] + CLANG_ARGS)}',
         f'genflags = {" ".join(GEN_FLAGS)} {inc}',
         f'rtflags = {" ".join(RT_FLAGS)} {rt_inc}',
         f'ldflags = {" ".join(LINK_FLAGS)}',
@@ -563,6 +570,22 @@ def run_measured(cmd, env):
     return code, dt, info.PeakProcessMemoryUsed, info.PeakJobMemoryUsed
 
 
+def run_ninja(cmd, env):
+    """MP4: run_measured(cmd, env), run again up to WINE_RETRIES times after a failure under Wine. The time is that of
+    all runs, the peaks the largest of any."""
+    retries = WINE_RETRIES if wine_crt.under_wine() else 0
+    total = 0.0
+    peak_one = peak_all = 0
+    for attempt in range(retries + 1):
+        code, dt, one, every = run_measured(cmd, env)
+        total, peak_one, peak_all = total + dt, max(peak_one, one), max(peak_all, every)
+        if not code or attempt == retries:
+            break
+        print(f'build_game: Ninja failed under Wine (exit code {code}); a compiler may have failed to start, so it '
+              f'runs again ({attempt + 1}/{retries})', flush=True)
+    return code, total, peak_one, peak_all
+
+
 def total_ram():
     class MemStatus(ctypes.Structure):
         _fields_ = [('dwLength', wt.DWORD), ('dwMemoryLoad', wt.DWORD)] + \
@@ -640,7 +663,7 @@ def main():
         if not expected.is_file():
             sys.exit(f'{expected} not found: run tools/extract_exefs.py for {args.version}, or pass --expected')
         hashes = {f['name']: f['sha256'] for f in json.loads(expected.read_text())['files']}
-    global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
+    global CLANG, CLANG_ARGS, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
         NINJA = args.ninja.resolve()
     elif not NINJA.is_file() and (ROOT / 'bin' / 'ninja.exe').is_file():
@@ -649,6 +672,12 @@ def main():
     if args.toolchain:
         TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
         CLANG = TOOLCHAIN_BIN / 'clang.exe'
+        # MP4: llvm-mingw's clang.exe is a launcher that only adds -target x86_64-w64-mingw32 and starts clang-<n>.exe;
+        # calling that directly with the target gives the same compile and link commands (clang -###) with one
+        # process per object instead of two, and so half the chances of the start failure WINE_RETRIES is about.
+        real = sorted(TOOLCHAIN_BIN.glob('clang-[0-9]*.exe'))
+        if real:
+            CLANG, CLANG_ARGS = real[-1], ['--target=x86_64-w64-mingw32']
         AR = TOOLCHAIN_BIN / 'llvm-ar.exe'
         WINDRES = TOOLCHAIN_BIN / 'llvm-windres.exe'
         DEPS = (args.deps or DEFAULT_DEPS).resolve()
@@ -719,7 +748,7 @@ def main():
     nfiles = sum(len(v) for v in mods.values())
     print(f'build_game: {nfiles} generated files in {len(linked)} modules ({", ".join(linked)}), {jobs} jobs', flush=True)
 
-    code, dt, peak_one, peak_all = run_measured(base + ['objects'], env)
+    code, dt, peak_one, peak_all = run_ninja(base + ['objects'], env)
     print(f'compile: {dt:.1f} s, peak {mib(peak_one)} per process, {mib(peak_all)} all processes')
     if code:
         sys.exit(code)
@@ -731,7 +760,7 @@ def main():
         return
     if args.make_runtime_lib:
         exe.unlink(missing_ok=True)   # ar rcs would keep members of deleted sources
-    code, dt, peak_one, _ = run_measured(base + [flag_path(exe)], env)
+    code, dt, peak_one, _ = run_ninja(base + [flag_path(exe)], env)
     print(f'link: {dt:.1f} s, peak {mib(peak_one)}')
     if code:
         print(f'build_game: link failed, {flag_path(exe)} is the old one (a running mp4.exe from this dir locks it)',
