@@ -457,5 +457,30 @@ class WineToolTest(unittest.TestCase):
         self.assertEqual(inherited, 'None')   # popped, so the tool's own children do not overwrite it
 
 
+class WineCrtTest(unittest.TestCase):
+    """MP4: tools/wine_crt.py (issue #11). The thunks are the first 24 bytes of crealf and cimagf, and of creal, in
+    ucrtbase under Proton 10.0-4's Wine; the patch writes only over the stub thunk, and does nothing off Wine."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import wine_crt
+        self.wine_crt = wine_crt
+
+    def test_stub_thunks_are_recognised(self):
+        for thunk in ('4883ec28488d0d55980800488d15afa40800e829d4010090',
+                      '4883ec28488d0ded990800488d15dba50800e8c1d5010090'):
+            self.assertTrue(self.wine_crt.is_stub(bytes.fromhex(thunk)))
+
+    def test_an_implemented_function_is_left_alone(self):
+        self.assertFalse(self.wine_crt.is_stub(bytes.fromhex('f20f1001c39090909090909090909090534883ec3089cbf605')))
+
+    def test_replacements_fit_in_a_thunk(self):
+        self.assertTrue(all(len(c) <= self.wine_crt.STUB_LENGTH for c in self.wine_crt.CODE.values()))
+
+    def test_nothing_happens_off_wine(self):
+        self.assertEqual(self.wine_crt.patch(), [])
+
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,4 @@
-# From fe3h-pc-recomp recomp/gen.py @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged; an ADRP+ADD pair whose register is rewritten in between is no materialised address.
+# From fe3h-pc-recomp recomp/gen.py @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged; an ADRP+ADD pair whose register is rewritten in between is no materialised address; MP4: tools/wine_crt.py runs before numpy loads (issue #11).
 # From totk-pc-recomp recomp/gen.py @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 # Adapted from LAS Recomp tools/gen.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
 """Generate C for the ExeFS modules: function discovery, then parallel emission into chunked C files.
@@ -35,7 +35,14 @@ from collections import Counter
 from pathlib import Path
 
 import capstone
-import numpy as np
+
+# MP4: under Wine 10.0 (Proton 10.0) numpy's import calls C runtime functions that are only stubs there; wine_crt fills
+# them in first (tools/wine_crt.py, issue #11). Here as well as in the setup's launcher (tools/extract.py RUN_SCRIPT)
+# because each worker process imports this file afresh. Does nothing outside Wine.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+import wine_crt  # noqa: E402
+wine_crt.patch()
+import numpy as np  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))

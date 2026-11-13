@@ -27,8 +27,18 @@ DAMAGE = re.compile(rf'^\w*Error: (.*(?:{DAMAGE_TEXT.pattern}).*)$', re.M)
 
 # Runs a tools/ script by path with its folder first on sys.path (installer/steps.py run_tool). MP4: under Wine the
 # setup starts the tool through /bin/sh and gets no handle for it, so the tool writes its process id to the file
-# MP4_TOOL_PID_FILE names (installer/wine.py start_tool).
+# MP4_TOOL_PID_FILE names (installer/wine.py start_tool). MP4: on Windows, and so under Wine, wine_crt.patch first fills
+# in the C runtime functions Wine 10.0 (Proton 10.0) leaves as stubs, which numpy calls while it imports (issue #11); it
+# does nothing outside Wine. The bundled Python finds wine_crt on its path (python314._pth lists tools/); a Python
+# without tools/ on its path (the tests) runs without it.
 RUN_SCRIPT = ('import os, runpy, sys\n'
+              "if os.name == 'nt':\n"
+              '    try:\n'
+              '        import wine_crt\n'
+              '    except ImportError:\n'
+              '        pass\n'
+              '    else:\n'
+              '        wine_crt.patch()\n'
               "f = os.environ.pop('MP4_TOOL_PID_FILE', None)\n"
               'if f:\n'
               "    with open(f + '.tmp', 'w') as o: o.write(str(os.getpid()))\n"

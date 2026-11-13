@@ -106,10 +106,11 @@ LLVM_BIN = {'clang.exe', 'clang++.exe', 'clang-23.exe', 'ld.lld.exe', 'llvm-ar.e
 LLVM_SKIP_DIRS = {'aarch64-w64-mingw32', 'armv7-w64-mingw32', 'i686-w64-mingw32', 'busybox', 'python', 'share'}
 LLVM_SKIP_SUFFIXES = {'.idl', '.tlb'}
 
-# tools/ files the installer steps run (and what they import), copied from the repo.
+# tools/ files the installer steps run (and what they import), copied from the repo. hostmem: gen.py sizes its workers
+# by free RAM; wine_crt: extract.RUN_SCRIPT runs it before every tool.
 TOOLS_FILES = ['build_game.py', 'build_shaders.py', 'check_content.py', 'extract.py', 'extract_exefs.py',
                'extract_romfs.py', 'hostmem.py', 'pack_shader_cache.py', 'prepare_shaders.py', 'romfs_index.py',
-               'shader_inventory.py']   # hostmem: gen.py sizes its workers by free RAM
+               'shader_inventory.py', 'wine_crt.py']
 SHADER_LIST = None   # main(): --shader-list
 PIPELINE_LIST = None   # main(): --pipeline-list, None without one
 TOOLS_DIRS = ['data']   # tools/data/: expected hashes
