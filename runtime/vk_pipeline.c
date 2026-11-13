@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/vk_pipeline.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; the front face is mirrored for the lower-left window origin; --prepare-shaders also builds the pipelines of pipeline-keys.bin.
+// From fe3h-pc-recomp runtime/vk_pipeline.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; the front face is mirrored for the lower-left window origin; --prepare-shaders also builds the pipelines of pipeline-keys.bin, except on a CPU device.
 // From totk-pc-recomp runtime/vk_pipeline.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Graphics and compute pipelines and descriptor layouts of the Vulkan replay. The op-stream replay (vk_exec.c)
 // collects NVN state into a VkPipeState and asks for the pipeline of each draw; this file maps that state to Vulkan,
@@ -3268,6 +3268,15 @@ int vk_pipeline_prepare_shaders(void) {
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
     if (rc) return rc;
+    // MP4: a CPU device (llvmpipe or lavapipe, where no GPU driver works: Wine under WSL, a Linux PC without its
+    // Vulkan driver) compiles every pipeline to x86 code it keeps in this process. Building the 35,765 records of
+    // pipeline-keys.bin that way held 11.8 GB before the memory limit ended it, and without a limit took WSL down (issue
+    // #11). The shaders are translated above, CPU work on any device; the pipelines are then left to play.
+    if (vk_ctx()->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !cfg_bool("PREPARE_ON_CPU")) {
+        printf("prepare-shaders: %s is a CPU device, not a GPU; the %zu listed pipelines are not built "
+               "(MP4_PREPARE_ON_CPU=1 builds them)\n", vk_ctx()->props.deviceName, K.file_n);
+        return 0;
+    }
     double t0 = now_ms();
     size_t listed = K.file_n;
     uint32_t built = prewarm_keys(0);
