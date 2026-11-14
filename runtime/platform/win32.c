@@ -310,6 +310,13 @@ int plat_exe_path(char *out, size_t cap) {
     return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) != 0;
 }
 
+const char *plat_wine_version(void) {
+    typedef const char *(*WineVersion)(void);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    WineVersion f = nt ? (WineVersion)(void *)GetProcAddress(nt, "wine_get_version") : NULL;
+    return f ? f() : NULL;
+}
+
 size_t plat_getenv(const char *name, char *out, size_t cap) {
     wchar_t wn[256], v[WPATH];
     if (!widen(name, wn, 256)) return 0;

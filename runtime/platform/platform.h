@@ -81,6 +81,8 @@ int plat_append_write(PlatAppend *f, const void *data, size_t n);   // 1 when al
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);
 int plat_exe_path(char *out, size_t cap);                 // path of the running executable; 0 on failure
+// The Wine version when the process runs under Wine or Proton (ntdll's wine_get_version), NULL on Windows.
+const char *plat_wine_version(void);
 // Environment variable as UTF-8 into out; its length, or 0 when unset, empty or too long for cap.
 size_t plat_getenv(const char *name, char *out, size_t cap);
 // The user's UI language as a BCP-47 tag ("ru-RU", "en-US"); "" when the system gives none. Valid for the process.

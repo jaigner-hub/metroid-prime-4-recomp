@@ -18,6 +18,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "layout.h"
+#include "platform/platform.h"
 
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
@@ -560,7 +561,12 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
             }
         commit(dst, n, "moved stack");
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
-        protect(src, n, PAGE_NOACCESS, "moved stack source");
+        // Horizon makes the source inaccessible. Under Wine the source stays read-write: Wine turns PAGE_NOACCESS
+        // into PROT_NONE, and a Linux driver's host-pointer import (amdgpu userptr) faults its pages in again after
+        // any change to their mapping, so a stack moved out of a heap chunk already imported (vk_memory.c
+        // arena_get) made every later submission fail with EFAULT (issue #11, RADV on a Steam Deck). The Windows
+        // drivers keep imported pages locked and never notice. The game does not touch a moved stack's source.
+        if (!plat_wine_version()) protect(src, n, PAGE_NOACCESS, "moved stack source");
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
     }
 out:

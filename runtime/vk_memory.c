@@ -22,6 +22,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
+#include "platform/platform.h"
 #include "vk.h"
 
 // Raw performance counter ticks for the tracking cost (no division on the replay's path); qpc_ms converts.
@@ -1177,9 +1178,15 @@ static void mirror_mode(int discrete) {
     if (mirror_gap < 0) mirror_gap = 0;
     // Submissions a region stays unwritten before it is frozen. 60 rather than 300: in a fight 100 of the 257 MiB
     // queried a frame lay in regions idle for 30-299 submissions, and a thaw by a write costs about 60 us.
+    // Off by default under Wine: a frozen region is read-only, and a Linux driver's host-pointer import (amdgpu
+    // userptr) needs write access to every imported page whenever it maps them again after a protection change, so
+    // the next submission would be refused (issue #11; memory.c stack_move has the PROT_NONE case of the same).
     const char *fi = cfg_get("MP4_FREEZE_IDLE");
-    freeze_idle = fi && *fi ? atoi(fi) : 60;
+    const char *wine = plat_wine_version();
+    freeze_idle = fi && *fi ? atoi(fi) : wine ? 0 : 60;
     if (freeze_idle < 0) freeze_idle = 0;
+    if (wine) rt_log("mem: under Wine %s: idle regions %s, moved stack sources stay accessible", wine,
+                     freeze_idle ? "freeze (MP4_FREEZE_IDLE)" : "never freeze");
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
            mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
 }
