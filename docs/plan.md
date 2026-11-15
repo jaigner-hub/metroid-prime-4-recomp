@@ -540,6 +540,24 @@ the null decoder). No host AAC decoder needed.
     overlay at an odd size (`res_scan_input` returns the pair to 1600x900 while ZL is held), morph ball, save and
     load, pause menu, map and the cinematics. If an odd size breaks a post effect, round scene_size to a coarser step
     (8 or 16) before dropping the scale.
+- Field of view (issue #20, 2026-11-15, not started). A player asked for an FOV setting. There is no camera patch yet:
+  `game_patch_stubs.c` res_wants_wide_overlay still returns 0, and a wider 21:9 picture is pillarboxed rather than
+  widened, for the same reason. The plan follows the render scale patch: find where the first-person camera's FOV
+  becomes a projection, change that load to read a factor from the patch page (a new set in
+  `recomp/patches-v131072.txt`), and expose it as `MP4_FOV` in `cfg.c` and the menu. A change at the FOV input, not
+  the matrix sent to the GPU, keeps whatever the engine works out from the camera (its frustum, culling, screen
+  projection of targets) consistent with the picture.
+  - Ways in, cheapest first: a tweak value in the RomFS (earlier Prime games keep the first-person FOV in tweak data),
+    which an overlay could change with no code patch; the conversion in `main` (degrees to radians, 0.0174533, times
+    half, then tan) traced back to the camera's FOV field; or the projection matrix found in a frame's uniform data
+    and its [0][0] write traced with `MP4_BREAK_WRITE`, as for the scanner (issue #10).
+  - Scale the FOV the game asks for by a factor rather than replacing it, so cutscene, morph ball and scripted
+    cameras keep their own views; or patch only the first-person camera's value.
+  - To check once it works: the arm cannon (drawn with the same projection, it may stretch or show where its model
+    ends; a separate projection for it is more work), the lock-on reticle, scan targets and HUD markers placed from
+    world positions, objects popping in at the new edges if streaming or culling uses a fixed view, shadow cascades.
+  - The same site gives ultrawide a widened view at the same vertical FOV, so res_wants_wide_overlay can then turn
+    on the wide UI overlays instead of pillarboxing.
 
 ## Shared core
 
