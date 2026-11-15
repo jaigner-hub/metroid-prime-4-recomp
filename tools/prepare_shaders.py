@@ -27,7 +27,8 @@ the render state of each pipeline play built, its shaders named by input id, a h
 again no game code. Preparing merges it into the build's pipeline-keys.bin before mp4.exe runs, and --prepare-shaders
 builds every record once, so a fresh install starts with the pipelines play met already built:
 
-    python tools/prepare_shaders.py --make-pipeline-list build/pipeline-list.bin build/v131072/pipeline-keys.bin [more...]
+    python tools/prepare_shaders.py --make-pipeline-list build/pipeline-list.bin build/v131072/pipeline-keys.bin [more...] \
+        --aliases build/v131072/shader-cache/in-aliases.bin
 
 Preparing a build (Python 3.14 for compression.zstd: .venv-py314 or the installer's embeddable Python):
 
@@ -116,8 +117,39 @@ def union_keys(sources):
     return recs
 
 
-def make_pipeline_list(out, sources):
+ALIAS_MAGIC, ALIAS_VERSION = 0x41534b54, 1                # gfx_shader.c "input aliases"
+
+
+def read_aliases(path):
+    """{old input id: current input id} of a shader cache's in-aliases.bin (runtime/gfx_shader.c "input aliases")."""
+    b = Path(path).read_bytes()
+    if len(b) < 40 or (len(b) - 40) % 64 or struct.unpack_from('<II', b) != (ALIAS_MAGIC, ALIAS_VERSION):
+        raise SystemExit(f'{path}: not an input alias file')
+    return {b[o:o + 32]: b[o + 32:o + 64] for o in range(40, len(b), 64)}
+
+
+def canonical(recs, aliases):
+    """The records with their shaders named by the ids the current use masks give (issue #18): records recorded under
+    version 2 masks name variants a fresh install never stores inputs for, so the boot prewarm would drop them. Records
+    that become equal are kept once."""
+    out, seen, renamed = [], set(), 0
+    for r in recs:
+        vs, fs = aliases.get(r[0:32], r[0:32]), r[32:64]
+        if fs != bytes(32):
+            fs = aliases.get(fs, fs)
+        n = vs + fs + r[64:]
+        renamed += n != r
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    print(f'input aliases: {renamed} records renamed, {len(recs) - len(out)} merged into others')
+    return out
+
+
+def make_pipeline_list(out, sources, aliases=None):
     recs = union_keys(sources)
+    if aliases:
+        recs = canonical(recs, read_aliases(aliases))
     write_keys(out, recs)
     print(f'pipeline list: {len(recs)} pipelines from {len(sources)} file(s) -> {out}')
     return 0
@@ -190,6 +222,9 @@ def main():
     ap.add_argument('--make-list', type=Path, metavar='OUT', help='write a list from the answers files given after it')
     ap.add_argument('--make-pipeline-list', type=Path, metavar='OUT',
                     help='write a pipeline list from the pipeline-keys.bin files given after it')
+    ap.add_argument('--aliases', type=Path, metavar='FILE',
+                    help='with --make-pipeline-list: shader-cache/in-aliases.bin of the build that played, so the list '
+                         'names shaders by their current input ids')
     ap.add_argument('sources', type=Path, nargs='*', help='with --make-list: shader-answers.bin files; with '
                                                           '--make-pipeline-list: pipeline-keys.bin files')
     a = ap.parse_args()
@@ -197,7 +232,7 @@ def main():
         sources = ([a.build] if a.build else []) + a.sources
         if not sources:
             ap.error('--make-pipeline-list needs at least one pipeline-keys.bin')
-        return make_pipeline_list(a.make_pipeline_list, sources)
+        return make_pipeline_list(a.make_pipeline_list, sources, a.aliases)
     if a.make_list:
         sources = ([a.build] if a.build else []) + a.sources
         if not sources:
