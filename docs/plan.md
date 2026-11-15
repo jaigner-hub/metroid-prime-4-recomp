@@ -604,13 +604,23 @@ the null decoder). No host AAC decoder needed.
   - Checked: the self-test and `--probe-vkexec` pass; scripted runs with the save draw program 118 through its
     geometry stage, end cleanly, and the last frame renders as before. Not yet seen: a probe cube draw (none in the
     save's area), so the dark spots of #18 and #15 are untested; Fury Green, where they were reported, is the test.
-- Crash after the grapple (issue #21, 2026-11-15, not fixed). `vk: staging buffer of 57081856 bytes failed (-2)` after
-  about two hours of play: `memory commit: this process 32725 MB, the system 43392 of 44220 MB`, the Windows commit
-  limit reached (a 6 GB GTX 1060, the reporter of #16). The log is from 0.4.7 to 0.4.14. Leads, not verified:
-  `memory.c` mem_shadow_reserve commits each light-volume shadow whole and mem_shadow_release commits it again, and
-  committed pages count against the limit untouched (18 shadows, about 10 GB, early in that log); `vk_memory.c`
-  vk_staging could split a large upload instead of stopping; a commit line in the periodic memory census would show
-  the growth. The pipeline count above (#18) also lowers driver memory.
+- Crash after the grapple (issue #21, 2026-11-15). `vk: staging buffer of 57081856 bytes failed (-2)` after about two
+  hours of play: `memory commit: this process 32725 MB, the system 43392 of 44220 MB`, the Windows commit limit reached
+  (a 6 GB GTX 1060, the reporter of #16; log from 0.4.7 to 0.4.14).
+  - `memory.c` mem_shadow_reserve committed each virtual pool's shadow whole at its creation, and mem_shadow_release
+    decommitted and committed it again "as zero pages". Committed pages count against the limit untouched: 18 shadows,
+    about 10 GB, early in that log. Now a shadow is reserved only: a mapping commits the pages it copies
+    (mem_shadow_commit, which now thaws frozen regions first), a read of a page nothing mapped (a whole-texture upload,
+    a stale read after the pool's finalization, issue #7) faults and commits its 2 MiB region as zero pages
+    (shadow_fault, in thaw_handler), and a release decommits. `vk_texture.c` storage_texels lets shadow storage
+    through its not-committed check.
+  - The profile's save (first area): 2,436 MiB of shadows, 9 MiB of them committed; private bytes at the end of the
+    same 75 s run 11,071 MiB against 13,515. Same frame as before. The friend-late save's small pools committed 26 of
+    52 MiB through reads of unmapped pages, so the fault path runs.
+  - `vk_memory.c` vk_staging tries a failed staging allocation again for up to a second (the caller is recording the
+    open upload batch, so nothing can be flushed there) before it stops, now with a message naming the page file.
+  - The memory census (every 18,000 frames, every 600 with `MP4_TRACE=perf`) now logs the process and system commit
+    and the shadows' committed bytes, so a long session's log shows what grows.
 - Desert stutter (issue #13, 2026-11-15): the attached log is from 0.4.3 or older; its 130-640 ms spikes are DualSense
   reconnects, fixed in 0.4.6. The 16-33 ms frames are GPU-bound runs, guest CPU frames and ~100 ms fence waits with
   VRAM near its budget. Between 0.4.7 and 0.4.11 the runtime changed only in the mouse gyro (inactive unless chosen)

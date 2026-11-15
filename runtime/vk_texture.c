@@ -1672,9 +1672,11 @@ static int region_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
 static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
     // Storage that is not committed (a virtual pool's shadow released at nvnMemoryPoolFinalize, issue #7): logged with
     // the texture and its pool, and not copied, instead of faulting in tex_bl_copy.
+    // Shadow storage commits on first touch (memory.c shadow_fault): reserved pages there read as zeros.
     MEMORY_BASIC_INFORMATION mi;
-    if (!VirtualQuery(t->mem, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
-        (const uint8_t *)mi.BaseAddress + mi.RegionSize < t->mem + (t->L.size < 4096 ? t->L.size : 4096)) {
+    if (!mem_is_shadow((uintptr_t)t->mem, t->L.size) &&
+        (!VirtualQuery(t->mem, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+         (const uint8_t *)mi.BaseAddress + mi.RegionSize < t->mem + (t->L.size < 4096 ? t->L.size : 4096))) {
         static volatile long n_gone;
         log_limited(&n_gone, "%sTexels: storage %p of texture serial %llu (%ux%ux%u format %#x, %#llx bytes) is not committed (state %#lx); pool %p mem %p size %#llx magic %#x",
                     write ? "Write" : "Read", (void *)t->mem, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,

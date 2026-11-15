@@ -1784,6 +1784,14 @@ void vk_mem_vram_log(uint64_t frame, const char *why) {
            alloc_bytes / M, (unsigned long long)t.live, (unsigned long long)t.own_live, t.bytes_live / M,
            (unsigned long long)t.released, (unsigned long long)t.own_released, t.bytes_released / M, (long long)m_live_n,
            m_live_bytes / M, dead_pending());
+    // Host commit beside it: what reached the commit limit in issue #21 (a 2-hour session) was not in the log.
+    double proc, used, limit;
+    uint64_t sc, sr, sf;
+    plat_commit_info(&proc, &used, &limit);
+    mem_shadow_stats(&sc, &sr, &sf);
+    rt_log("mem: commit frame %llu: this process %.0f MB, the system %.0f of %.0f MB; virtual pool shadows %.0f of %.0f MiB "
+           "committed (%.0f MiB by reads of unmapped pages)", (unsigned long long)frame, proc, used, limit, sc / M, sr / M,
+           sf / M);
     if (!why) return;
     char line[1024];
     size_t k = (size_t)snprintf(line, sizeof line, "mem: %s; heaps (vma blocks / vma budget, driver usage / driver budget MiB):", why);
@@ -2031,7 +2039,22 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VkBuffer b;
     VmaAllocation a;
     VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
-    if (r != VK_SUCCESS) rt_fatal("vk: staging buffer of %llu bytes failed (%d)", (unsigned long long)size, (int)r);
+    // Out of host memory: the system's commit limit (RAM and page file) is reached (issue #21). The caller is recording
+    // into the open upload batch, so nothing of ours can be flushed here; other threads release memory as their work
+    // retires, so it is tried again for up to a second before the game stops.
+    for (int tries = 0; r != VK_SUCCESS && tries < 10; tries++) {
+        if (!tries) {
+            double proc, used, limit;
+            plat_commit_info(&proc, &used, &limit);
+            rt_log("vk: staging buffer of %llu bytes failed (%d), memory commit: this process %.0f MB, the system %.0f of "
+                   "%.0f MB; trying again", (unsigned long long)size, (int)r, proc, used, limit);
+        }
+        Sleep(100);
+        r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
+    }
+    if (r != VK_SUCCESS)
+        rt_fatal("vk: staging buffer of %llu bytes failed (%d): Windows is out of commit memory (RAM and page file); a "
+                 "larger page file, or one Windows manages, gives the game room", (unsigned long long)size, (int)r);
     *buf = b;
     if (alloc) *alloc = a;   // the caller destroys it (vmaDestroyBuffer) after vk_upload_flush(1)
     else {

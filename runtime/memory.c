@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/memory.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; SetHeapSize refuses a size it cannot grant with OutOfMemory; shadow reservations for virtual pools mapped from CPU-visible pools; adds mem_is_shadow and mem_heap_range.
+// From fe3h-pc-recomp runtime/memory.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; SetHeapSize refuses a size it cannot grant with OutOfMemory; shadow reservations for virtual pools mapped from CPU-visible pools; adds mem_is_shadow and mem_heap_range; shadows commit on first touch (issue #21).
 // From totk-pc-recomp runtime/memory.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); renamed to fe3h; MapMemory also takes stacks from module data (FE3H).
 // Adapted from MacNativeGames games/totk/runtime/services.c and loader.c @ b75be8c (MIT, Copyright (c) 2026
 // MacNativeGames contributors), and LAS Recomp runtime/main.c and platform/windows.c @ da35b83 (MIT, Copyright (c)
@@ -56,6 +56,7 @@ static uint64_t shadow_next, shadow_end;   // virtual pool shadow reservations (
 static uint64_t shadow_lo[64], shadow_hi[64];   // the reservations made, for watched()
 static uint8_t shadow_free[64];               // released by nvnMemoryPoolFinalize, kept for the next pool that fits
 static int nshadow;
+static volatile LONG64 shadow_fault_bytes;      // committed by shadow_fault (mem_shadow_stats)
 static volatile LONG shadow_events;          // reservations and releases (mem_shadow_events: input script sync points)
 static SRWLOCK lock = SRWLOCK_INIT;
 static uint64_t heap_size, alias_bytes;
@@ -191,10 +192,16 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
     *other_thaws = (uint64_t)InterlockedExchange64(&frz_count[2], 0) + (uint64_t)InterlockedExchange64(&frz_count[3], 0);
 }
 
+static int shadow_fault(uint64_t a);
+
 // The first write into a frozen region thaws it and retries. A fault in a region another thread thawed meanwhile
-// retries too; any other fault goes on to the crash handler.
+// retries too, and so does a read or write of a shadow page not committed yet (shadow_fault); any other fault goes on
+// to the crash handler.
 static LONG CALLBACK thaw_handler(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 && er->ExceptionInformation[0] <= 1 &&
+        shadow_fault(er->ExceptionInformation[1]))
+        return EXCEPTION_CONTINUE_EXECUTION;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
         return EXCEPTION_CONTINUE_SEARCH;
     uint64_t a = er->ExceptionInformation[1];
@@ -309,8 +316,12 @@ const RtGuestLayout *mem_layout(void) { return &L; }
 
 // Shadow storage of a virtual pool mapped from CPU-visible pool memory (nvn_api_core.c): a watched reservation below
 // the address limit between the alias region and the module window, so textures over it are uploaded from it like
-// any CPU-written storage and the pages the mapping copies are tracked. The whole pool is committed at once (zero
-// pages cost nothing until touched): a texture upload reads its whole storage, mapped or not. The reservation is
+// any CPU-written storage and the pages the mapping copies are tracked. Only what is used is committed: a mapping
+// commits the pages it copies (mem_shadow_commit), and a read of a page nothing mapped (a whole-texture upload reads
+// its whole storage, mapped or not) faults and commits its 2 MiB region as zero pages (shadow_fault). Committing whole
+// pools at their creation, as before, charged the system commit limit for every page whether touched or not: about
+// 10 GB of light and fog volume pools early in a session, which with the rest ran a 44 GB limit out after two hours
+// (issue #21, vk_staging failing on the next upload). The reservation is
 // rounded up to whole 2 MiB regions, the unit of the write-watch snapshots (vk_memory.c snap_regions) and freezes
 // (FRZ_SIZE): a query over the last region of a pool that ends inside one (this game's 207 MiB light volume pools)
 // would reach past the reservation, GetWriteWatch refuses it, and every texture over the pool counted as untracked,
@@ -334,8 +345,6 @@ uint64_t mem_shadow_reserve(uint64_t size) {
     for (uint64_t at = shadow_next; at + size <= shadow_end; at += GiB)
         if (reserve_at(at, size, MEM_WRITE_WATCH)) {
             shadow_next = align_up(at + size, GiB);
-            if (!VirtualAlloc((void *)(uintptr_t)at, size, MEM_COMMIT, PAGE_READWRITE))
-                rt_fatal("memory: cannot commit %#llx bytes of virtual pool shadow", (unsigned long long)size);
             AcquireSRWLockExclusive(&lock);
             if (nshadow < 64) shadow_lo[nshadow] = at, shadow_hi[nshadow] = at + size, shadow_free[nshadow] = 0, nshadow++;
             ReleaseSRWLockExclusive(&lock);
@@ -346,32 +355,75 @@ uint64_t mem_shadow_reserve(uint64_t size) {
     return 0;
 }
 int mem_shadow_commit(uint64_t addr, uint64_t size) {
-    return VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    AcquireSRWLockExclusive(&frz_lock);   // a frozen region's read-only pages would turn writable unseen
+    thaw_range_locked(addr, size, 3);
+    int ok = VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    ReleaseSRWLockExclusive(&frz_lock);
+    return ok;
+}
+
+// A fault at a in a shadow reservation on a page that is only reserved: its 2 MiB region (within the reservation) is
+// committed, zero pages where nothing was committed and the committed pages as they were, and the access retries.
+// The region is thawed first, since a commit makes every page of the range writable. 0 for any other fault. The
+// shadow table only grows and its entries never move, so it is read without the lock here.
+static int shadow_fault(uint64_t a) {
+    int i = 0, n = __atomic_load_n(&nshadow, __ATOMIC_ACQUIRE);
+    while (i < n && !(a >= shadow_lo[i] && a < shadow_hi[i])) i++;
+    if (i == n) return 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) return 0;
+    if (mbi.State == MEM_COMMIT) return mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_READONLY;   // a race: retry
+    if (mbi.State != MEM_RESERVE) return 0;
+    uint64_t lo = a & ~(FRZ_SIZE - 1), hi = lo + FRZ_SIZE;
+    if (lo < shadow_lo[i]) lo = shadow_lo[i];
+    if (hi > shadow_hi[i]) hi = shadow_hi[i];
+    AcquireSRWLockExclusive(&frz_lock);
+    thaw_range_locked(lo, hi - lo, 3);
+    int ok = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    ReleaseSRWLockExclusive(&frz_lock);
+    if (ok) InterlockedAdd64(&shadow_fault_bytes, (LONG64)(hi - lo));
+    return ok;
+}
+
+// Committed bytes of every shadow reservation and the bytes shadow_fault committed so far (the memory census).
+void mem_shadow_stats(uint64_t *committed, uint64_t *reserved, uint64_t *faulted) {
+    *committed = *reserved = 0;
+    *faulted = (uint64_t)__atomic_load_n(&shadow_fault_bytes, __ATOMIC_RELAXED);
+    AcquireSRWLockShared(&lock);
+    for (int i = 0; i < nshadow; i++) {
+        *reserved += shadow_hi[i] - shadow_lo[i];
+        MEMORY_BASIC_INFORMATION mbi;
+        for (uint64_t x = shadow_lo[i]; x < shadow_hi[i] && VirtualQuery((void *)(uintptr_t)x, &mbi, sizeof mbi);) {
+            uint64_t y = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (y > shadow_hi[i]) y = shadow_hi[i];
+            if (mbi.State == MEM_COMMIT) *committed += y - x;
+            x = y;
+        }
+    }
+    ReleaseSRWLockShared(&lock);
 }
 // A finalized pool's shadow is not given back: textures over it can outlive the pool in the host's tables, and the
 // first upload of one after the pool is gone read freed pages (nvnQueueSubmitCommands faulting in tex_bl_copy on the
 // way out of Sol Valley, issue #7; on the console that read meets unmapped GPU memory, not a fault). Its pages go back
-// to zero pages (no memory until touched) and the reservation is kept for the next virtual pool that fits, which keeps
-// the address space bounded. A reservation past the 64 tracked is freed as before.
+// back to reserved (a later read commits zero pages, shadow_fault) and the reservation is kept for the next virtual
+// pool that fits, which keeps the address space bounded. A reservation past the 64 tracked is freed as before.
 void mem_shadow_release(uint64_t addr) {
     AcquireSRWLockExclusive(&lock);
     int i = 0;
     while (i < nshadow && shadow_lo[i] != addr) i++;
     if (i < nshadow) {
         uint64_t size = shadow_hi[i] - shadow_lo[i];
-        if (!VirtualFree((void *)(uintptr_t)addr, size, MEM_DECOMMIT) ||
-            !VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, PAGE_READWRITE))
-            rt_fatal("memory: cannot reset virtual pool shadow %#llx+%#llx", (unsigned long long)addr, (unsigned long long)size);
+        decommit(addr, size, "virtual pool shadow");   // thaws its frozen regions first
         ResetWriteWatch((void *)(uintptr_t)addr, size);
         shadow_free[i] = 1;
     }
     ReleaseSRWLockExclusive(&lock);
-    rt_log("memory: virtual pool shadow %#llx released%s", (unsigned long long)addr, i < nshadow ? " (kept as zero pages)" : "");
+    rt_log("memory: virtual pool shadow %#llx released%s", (unsigned long long)addr, i < nshadow ? " (decommitted, kept reserved)" : "");
     InterlockedIncrement(&shadow_events);
     if (i == nshadow) VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE);
 }
-// 1 when [addr, addr+size) lies in one shadow reservation: committed as zero pages, so a page nothing wrote (no write
-// generation, vk_memory.c) holds zeros (vk_texture.c upload_part).
+// 1 when [addr, addr+size) lies in one shadow reservation, where a page nothing wrote (no write generation,
+// vk_memory.c) reads as zeros (vk_texture.c upload_part): committed at its first touch (shadow_fault).
 // The committed guest heap [lo, hi); 0 before SetHeapSize. vk_memory.c arena_get imports chunks of it.
 int mem_heap_range(uint64_t *lo, uint64_t *hi) {
     AcquireSRWLockShared(&lock);
