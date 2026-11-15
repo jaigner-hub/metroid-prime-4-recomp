@@ -32,7 +32,10 @@
 #include "vk_exec.h"
 
 #define MAX_BINDINGS 128
-#define MAX_DESC 2048   // a light-list texture array alone is 1024 (tools/xlate/Program.cs)
+// Descriptors one pipeline's sets hold. A light-list texture array alone is 1024 (tools/xlate/Program.cs), and the
+// campfire conversation of issue #24 binds a pipeline with 2059. Everything sized by it is
+// a single static buffer (bind_resources, rs_list, DS, RS), so the headroom costs well under a megabyte.
+#define MAX_DESC 4096
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 65536u
 #define SUPPORT_BYTES 1408u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
