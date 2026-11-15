@@ -103,6 +103,13 @@ typedef struct {
     HANDLE thread;
     int busy, quit;
     uint64_t gen;                            // bumped by Flush, Stop, Reset, destruction: a decode in flight is dropped
+    // The stall watch (watch_stall): the game's last entry call, and the frame and hand-over counts at the last progress.
+    const char *volatile last_call;
+    volatile uint64_t last_call_ns;
+    volatile LONG calls;                     // entry calls so far (note_entry)
+    LONG calls_at_progress;
+    uint64_t progress_ns, frames_seen, handed_seen;
+    int stall_logged;
 } Movie;
 
 static MovieGuest G;
@@ -575,6 +582,39 @@ static void release_due(Movie *m, uint64_t now) {
     m->owed |= 1u << MOVIE_EV_OUTPUT;
 }
 
+// With m->mu held, at every present: a started decoder that neither decoded nor handed a frame over for 2 s is logged
+// once with its queues and the game's last call into it, and again when it moves on (issue #25: both intro movies
+// stopped a few frames in on one machine while the game kept presenting; the call log had run out by then).
+static void watch_stall(Movie *m, uint64_t now) {
+    if (!m->started) {
+        m->progress_ns = 0;
+        return;
+    }
+    if (!m->progress_ns || m->st.frames != m->frames_seen || m->st.handed != m->handed_seen) {
+        if (m->stall_logged)
+            rt_log("movie: decoder %#llx moves on after %.1f s (frame %llu, %llu handed over)", (unsigned long long)m->guest,
+                   (now - m->progress_ns) / 1e9, (unsigned long long)m->st.frames, (unsigned long long)m->st.handed);
+        m->progress_ns = now;
+        m->frames_seen = m->st.frames;
+        m->handed_seen = m->st.handed;
+        m->calls_at_progress = m->calls;
+        m->stall_logged = 0;
+        return;
+    }
+    if (m->stall_logged || now - m->progress_ns < 2000000000ull) return;
+    m->stall_logged = 1;
+    int held = OUT_BUFS - free_outs(m);
+    uint64_t lc = m->last_call_ns;
+    long long due = m->ndecoded && m->t0 ? ((long long)due_at(m, &m->decoded[0]) - (long long)now) / 1000000 : 0;
+    rt_log("movie: decoder %#llx stalled %.1f s at frame %llu (%llu handed over, %llu dropped%s): %d inputs free, %d "
+           "pending, worker %s; %d decoded (first due in %lld ms), %d handed over not taken, %d of %d output slots held; "
+           "%ld game calls since, the last %s %.0f ms ago",
+           (unsigned long long)m->guest, (now - m->progress_ns) / 1e9, (unsigned long long)m->st.frames,
+           (unsigned long long)m->st.handed, (unsigned long long)m->st.dropped, m->eos_in ? ", end of stream in" : "",
+           m->nin_free, m->npending, m->busy ? "busy" : "idle", m->ndecoded, due, m->nready, held, OUT_BUFS,
+           (long)(m->calls - m->calls_at_progress), m->last_call ? m->last_call : "(none)", lc ? (now - lc) / 1e6 : 0.0);
+}
+
 void movie_tick(Cpu *c) {
     if (!g_count) return;
     Signals s = {0};
@@ -583,7 +623,9 @@ void movie_tick(Cpu *c) {
         Movie *m = g_movies[i];
         if (!m) continue;
         AcquireSRWLockExclusive(&m->mu);
-        if (m->started) release_due(m, g_clock());
+        uint64_t now = g_clock();
+        if (m->started) release_due(m, now);
+        watch_stall(m, now);
         collect(m, &s);
         ReleaseSRWLockExclusive(&m->mu);
     }
@@ -707,11 +749,13 @@ static void ov_d0(Cpu *c) {
     pass(c, MOVIE_D0);
 }
 
-// The first calls on a null decoder, logged by name: the player's protocol, for reading its reaction.
-static void note_entry(const Movie *m, const char *name) {
-    if (!m->unsupported && !m->h264) return;
-    static volatile LONG calls;
-    if (InterlockedIncrement(&calls) <= 60) rt_log("movie: null decoder %#llx: %s", (unsigned long long)m->guest, name);
+// The first 60 calls on each null or H.264 decoder, logged by name: the player's protocol, for reading its reaction;
+// every call is kept as the decoder's last for the stall watch.
+static void note_entry(Movie *m, const char *name) {
+    m->last_call = name;
+    m->last_call_ns = g_clock();
+    LONG n = InterlockedIncrement(&m->calls);
+    if ((m->unsupported || m->h264) && n <= 60) rt_log("movie: null decoder %#llx: %s", (unsigned long long)m->guest, name);
 }
 
 // Status Configure(MediaData *format)
@@ -1031,9 +1075,18 @@ static int texture_write(Cpu *c, Movie *m, int index, uint8_t *data, uint64_t ca
                t->d.format, t->d.flags);
     int w = m->w < t->d.width ? m->w : t->d.width, h = m->h < t->d.height ? m->h : t->d.height;
     NVNcopyRegion r = {0, 0, 0, w, h, 1};
+    uint64_t t0 = kern_now_ns();
     {
         NVN_BLOCKING();
         gfx_backend()->write_texels(t, NULL, &r, m->out[index], (uint64_t)m->w * 4, 0);
+    }
+    // A write that blocks holds the game's movie thread, which feeds every decoder (issue #25): the slow ones are logged.
+    uint64_t dt = kern_now_ns() - t0;
+    if (dt > 50000000ull) {
+        static volatile LONG slow;
+        if (InterlockedIncrement(&slow) <= 20)
+            rt_log("movie: decoder %#llx: frame %d took %.0f ms to write into its texture", (unsigned long long)m->guest,
+                   index, dt / 1e6);
     }
     // In texture mode the frame now lives in the game's texture and the library's buffer is free again: the game
     // never calls ReleaseOutputBufferIndex for it (it did not for the first eight frames, and the decoder stalled with
