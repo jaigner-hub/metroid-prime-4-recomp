@@ -1,8 +1,8 @@
-# From totk-pc-recomp tools/pack_shader_cache.py @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to mp4 only.
+# From totk-pc-recomp tools/pack_shader_cache.py @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), totk renamed to mp4; MP4: loose files are read from the 256 subfolders as well (issue #11).
 """Fold the loose files of a shader cache into <cache>/shader-cache.pack and delete them.
 
-The translator writes four files per shader into the cache (runtime/gfx_shader.c): <key>.spv, <key>.res.json,
-<name>.use and in/<input id>.in, about 117,000 files after an install, which are slow to copy, back up, scan and sync.
+The translator writes four files per shader into the cache (runtime/gfx_shader.c): <ab>/<key>.spv, <ab>/<key>.res.json,
+<ab>/<name>.use and in/<ab>/<input id>.in, <ab> the name's first two hex digits, about 117,000 files after an install, which are slow to copy, back up, scan and sync.
 mp4.exe reads the pack first and the loose files after it, and keeps writing new translations as loose files, so
 this tool can run again at any time the game is closed: it merges the existing pack with the loose files (a loose file
 wins over a packed one of the same name) and writes the pack anew. The installer runs it after preparing the shaders.
@@ -29,10 +29,18 @@ NAME = re.compile(r'([0-9a-f]{64})(\.spv|\.res\.json|\.use|\.in)')
 USE_SIZE = 20   # gfx_shader.c use_store: magic, version, three masks
 
 
+def folders(cache):
+    """(folder, kinds) of every folder that can hold loose files: the 256 subfolders (gfx_shader.c, "loose files"), and
+    the top folder and in/ themselves, where versions before the subfolders wrote them."""
+    subs = [f'{i:02x}' for i in range(256)]
+    return ([(cache, (1, 2, 3)), (cache / 'in', (4,))] + [(cache / s, (1, 2, 3)) for s in subs]
+            + [(cache / 'in' / s, (4,)) for s in subs])
+
+
 def loose_files(cache):
     """{(kind, name): path} of the cache's loose files; *.in only in in/."""
     found = {}
-    for folder, kinds in ((cache, (1, 2, 3)), (cache / 'in', (4,))):
+    for folder, kinds in folders(cache):
         if not folder.is_dir():
             continue
         with os.scandir(folder) as it:
@@ -118,10 +126,11 @@ def pack(cache, keep=False):
     if not keep:
         for p in written:
             p.unlink(missing_ok=True)
-        try:
-            (cache / 'in').rmdir()   # only when empty
-        except OSError:
-            pass
+        for folder, _ in reversed(folders(cache)[1:]):   # the subfolders, then in/; only when empty
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
     return len(index), len(written), skipped, offset
 
 

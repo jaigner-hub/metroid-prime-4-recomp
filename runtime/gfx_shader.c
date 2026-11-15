@@ -1,10 +1,10 @@
-// From fe3h-pc-recomp runtime/gfx_shader.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; integer textures are answered with _uint / _sint suffixes.
+// From fe3h-pc-recomp runtime/gfx_shader.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; integer textures are answered with _uint / _sint suffixes; loose cache files go in 256 subfolders (issue #11).
 // From totk-pc-recomp runtime/gfx_shader.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Shader service client: turns an NVN program (control section, code, c1 constants and the
 // translator's answers) into SPIR-V plus reflection through `mp4_xlate.exe --serve` children, started lazily with
 // pipes and kept for the life of the process (a pool: MP4_XLATE_PROCS at run time, more for the boot prewarm).
-// Results are cached in memory and on disk (shader-cache/<key>.spv and <key>.res.json next to mp4.exe), so a shader
-// is translated once per machine and translator.
+// Results are cached in memory and on disk (shader-cache/<ab>/<key>.spv and <key>.res.json next to mp4.exe, <ab> the
+// key's first byte: section "loose files"), so a shader is translated once per machine and translator.
 //
 // Keys. The code hash is sha256 over stage (u32), the 0x880-byte control section, code_size (u64), the code, the c1
 // length (u32) and bytes. Per code hash and translator the cache holds a use mask (<sha256("TKSU", xlate id, code
@@ -25,7 +25,7 @@
 // preparing the shaders. The pack is read-only here. Every read looks in the pack first and then for the loose file,
 // and new translations are written as loose files as before, until the tool runs again (section "cache pack").
 //
-// Stored inputs: every translation also writes <cache>/in/<input id>.in (magic "TKSI"; stage, the full answers, the
+// Stored inputs: every translation also writes <cache>/in/<ab>/<input id>.in (magic "TKSI"; stage, the full answers, the
 // control section, the code up to its length, c1), so a pipeline key record (vk_pipeline.c), which names its shaders by
 // input id, can be translated again under a new translator without guest memory (gfx_shader_load_input,
 // gfx_shader_prewarm).
@@ -133,6 +133,87 @@ static INIT_ONCE paths_once = INIT_ONCE_STATIC_INIT;
 #define mkdir_p plat_file_mkdir_p
 #define read_file plat_file_read
 #define write_file plat_file_write
+
+// ---- loose files: <cache>/<ab>/<name><ext> and <cache>/in/<ab>/<name>.in, <ab> the name's first two hex digits
+// 256 subfolders rather than one folder of every file (57,000 in the top folder and 27,000 in in/ while the installer
+// prepares the shaders). Under Wine a lookup that misses the exact name reads the whole folder to look for the name in
+// another case, as Linux file systems are case-sensitive, and a translation looks up about ten names that do not exist
+// yet (the code file, the translator's outputs, the renames, the stored inputs): in one flat folder the prepare step
+// slowed from 26 to 10 shaders a second as the folder grew, its threads queued on the directory lock (issue #11).
+// Earlier versions wrote flat folders; init_paths moves such files into the subfolders once (shard_migrate).
+
+static int hex2(const char *c) {
+    int v = 0;
+    for (int i = 0; i < 2; i++) {
+        int d = c[i] >= '0' && c[i] <= '9' ? c[i] - '0' : c[i] >= 'a' && c[i] <= 'f' ? c[i] - 'a' + 10 : -1;
+        if (d < 0) return -1;
+        v = v << 4 | d;
+    }
+    return v;
+}
+
+static void shard_dir(int in, const char *hex, char *p) {
+    snprintf(p, PATH_CAP + 80, in ? "%s\\in\\%.2s" : "%s\\%.2s", cache_dir, hex);
+}
+
+static void loose_path(const char *hex, const char *ext, char *p) {
+    snprintf(p, PATH_CAP + 80, "%s\\%.2s\\%s%s", cache_dir, hex, hex, ext);
+}
+
+static void in_loose_path(const char *hex, char *p) {
+    snprintf(p, PATH_CAP + 80, "%s\\in\\%.2s\\%s.in", cache_dir, hex, hex);
+}
+
+// Creates the subfolder of hex before a write; once per subfolder and process.
+static volatile LONG shard_made[2][8];
+static void shard_make(int in, const char *hex) {
+    int b = hex2(hex);
+    if (b < 0) return;
+    LONG bit = (LONG)(1u << (b & 31));
+    if (shard_made[in][b >> 5] & bit) return;
+    char d[PATH_CAP + 80];
+    shard_dir(in, hex, d);
+    mkdir_p(d);
+    InterlockedOr(&shard_made[in][b >> 5], bit);
+}
+
+// 1 when name is a cache file name: 64 hex digits and one of exts.
+static int loose_name(const char *name, const char *const *exts) {
+    size_t n = strlen(name);
+    if (n < 64) return 0;
+    for (int i = 0; i < 64; i += 2)
+        if (hex2(name + i) < 0) return 0;
+    for (int i = 0; exts[i]; i++)
+        if (!strcmp(name + 64, exts[i])) return 1;
+    return 0;
+}
+
+// Moves the loose files of a flat folder (earlier versions) into the subfolders. A no-op once done: the top folder then
+// holds the subfolders, in/ and the pack.
+static int shard_migrate_dir(int in) {
+    static const char *const top[] = {".spv", ".res.json", ".use", NULL}, *const ins[] = {".in", NULL};
+    char pattern[PATH_CAP + 16], from[PATH_CAP + 80], to[PATH_CAP + 80];
+    snprintf(pattern, sizeof pattern, in ? "%s\\in\\*" : "%s\\*", cache_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileExA(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !loose_name(fd.cFileName, in ? ins : top)) continue;
+        snprintf(from, sizeof from, in ? "%s\\in\\%s" : "%s\\%s", cache_dir, fd.cFileName);
+        shard_make(in, fd.cFileName);
+        snprintf(to, sizeof to, in ? "%s\\in\\%.2s\\%s" : "%s\\%.2s\\%s", cache_dir, fd.cFileName, fd.cFileName);
+        n += plat_file_replace(from, to);
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+    return n;
+}
+
+static void shard_migrate(void) {
+    uint64_t t0 = plat_now_ns();
+    int n = shard_migrate_dir(0) + shard_migrate_dir(1);
+    if (n) rt_log("gfx_shader: moved %d loose cache files into subfolders in %.0f ms", n, (plat_now_ns() - t0) / 1e6);
+}
 
 // ---- cache pack (<cache>/shader-cache.pack, written by tools/pack_shader_cache.py)
 // Little-endian: "TKSPACK1", u32 count, u32 0, then count entries sorted by (kind, name), then the data. name is the
@@ -315,7 +396,7 @@ static BOOL CALLBACK init_paths(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s\\shader-cache", exe_dir);
     xlate_identity();
-    if (cache_dir[0]) pack_open();
+    if (cache_dir[0]) shard_migrate(), pack_open();
     use_preload_start();
     return TRUE;
 }
@@ -573,7 +654,7 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
     char hex[65], p[PATH_CAP + 80];
     key_hex(key, hex);
     uint64_t spv_size = 0, res_size = 0;
-    snprintf(p, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, hex);
+    loose_path(hex, ".res.json", p);
     uint8_t *res = packed ? pack_read(PACK_RES, key, &res_size) : read_file(p, &res_size);
     if (!res) return NULL;
     if (!reflection_valid((const char *)res, res_size)) {
@@ -582,7 +663,7 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         free(res);
         return NULL;
     }
-    snprintf(p, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
+    loose_path(hex, ".spv", p);
     uint8_t *spv = packed ? pack_read(PACK_SPV, key, &spv_size) : read_file(p, &spv_size);
     uint32_t magic = 0;
     if (spv && spv_size >= 20) memcpy(&magic, spv, 4);
@@ -828,13 +909,7 @@ static void use_name(const uint8_t h[32], uint8_t name[32]) {
 static void use_path_of(const uint8_t name[32], char *p) {
     char hex[65];
     key_hex(name, hex);
-    snprintf(p, PATH_CAP + 80, "%s\\%s.use", cache_dir, hex);
-}
-
-static void use_path(const uint8_t h[32], char *p) {
-    uint8_t name[32];
-    use_name(h, name);
-    use_path_of(name, p);
+    loose_path(hex, ".use", p);
 }
 
 // Every .use file of the cache, read by a background thread when the paths are set (use_preload), by file name: a
@@ -850,16 +925,6 @@ static UseFile **use_file_slot(const uint8_t name[32]) {
     UseFile **e = &use_files[(name[0] | name[1] << 8) % USE_FILE_BUCKETS];
     while (*e && memcmp((*e)->name, name, 32)) e = &(*e)->next;
     return e;
-}
-
-static int hex_byte(const char *c) {
-    int v = 0;
-    for (int i = 0; i < 2; i++) {
-        int d = isdigit((unsigned char)c[i]) ? c[i] - '0' : c[i] >= 'a' && c[i] <= 'f' ? c[i] - 'a' + 10 : -1;
-        if (d < 0) return -1;
-        v = v << 4 | d;
-    }
-    return v;
 }
 
 static DWORD WINAPI use_preload(void *arg) {
@@ -882,34 +947,37 @@ static DWORD WINAPI use_preload(void *arg) {
             *slot = x, n++;
         }
     }
-    snprintf(pattern, sizeof pattern, "%s\\*.use", cache_dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE f = FindFirstFileExA(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
-    if (f != INVALID_HANDLE_VALUE) {
-        do {
-            UseFile e = {0};
-            int ok = strlen(fd.cFileName) == 68;
-            for (int i = 0; ok && i < 32; i++) {
-                int v = hex_byte(fd.cFileName + 2 * i);
-                ok = v >= 0, e.name[i] = (uint8_t)v;
-            }
-            uint64_t len = 0;
-            uint32_t *u = NULL;
-            if (ok) {
-                snprintf(p, sizeof p, "%s\\%s", cache_dir, fd.cFileName);
-                u = (uint32_t *)read_file(p, &len);
-                ok = u && len == 20 && u[0] == USE_MAGIC && u[1] == USE_VERSION;
-            }
-            UseFile **slot = ok ? use_file_slot(e.name) : NULL, *x;
-            if (slot && !*slot && (x = malloc(sizeof *x))) {
-                e.m.slots = u[2], e.m.attrs = u[3], e.m.fouts = u[4];
-                *x = e, *slot = x, n++;
-            } else if (!ok) {
-                bad++;
-            }
-            free(u);
-        } while (FindNextFileA(f, &fd));
-        FindClose(f);
+    for (int sub = 0; sub < 256; sub++) {
+        snprintf(pattern, sizeof pattern, "%s\\%02x\\*.use", cache_dir, sub);
+        WIN32_FIND_DATAA fd;
+        HANDLE f = FindFirstFileExA(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL,
+                                    FIND_FIRST_EX_LARGE_FETCH);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                UseFile e = {0};
+                int ok = strlen(fd.cFileName) == 68;
+                for (int i = 0; ok && i < 32; i++) {
+                    int v = hex2(fd.cFileName + 2 * i);
+                    ok = v >= 0, e.name[i] = (uint8_t)v;
+                }
+                uint64_t len = 0;
+                uint32_t *u = NULL;
+                if (ok) {
+                    snprintf(p, sizeof p, "%s\\%02x\\%s", cache_dir, sub, fd.cFileName);
+                    u = (uint32_t *)read_file(p, &len);
+                    ok = u && len == 20 && u[0] == USE_MAGIC && u[1] == USE_VERSION;
+                }
+                UseFile **slot = ok ? use_file_slot(e.name) : NULL, *x;
+                if (slot && !*slot && (x = malloc(sizeof *x))) {
+                    e.m.slots = u[2], e.m.attrs = u[3], e.m.fouts = u[4];
+                    *x = e, *slot = x, n++;
+                } else if (!ok) {
+                    bad++;
+                }
+                free(u);
+            } while (FindNextFileA(f, &fd));
+            FindClose(f);
+        }
     }
     InterlockedExchange(&use_files_ready, 1);
     rt_log("gfx_shader: %d use masks read in %.0f ms on a background thread (%d unreadable)", n,
@@ -967,8 +1035,12 @@ static int use_find(const uint8_t h[32], UseMask *m) {
 }
 
 static void use_store(const uint8_t h[32], const UseMask *m) {
-    char p[PATH_CAP + 80];
-    use_path(h, p);
+    char p[PATH_CAP + 80], hex[65];
+    uint8_t name[32];
+    use_name(h, name);
+    key_hex(name, hex);
+    shard_make(0, hex);
+    use_path_of(name, p);
     uint32_t f[5] = {USE_MAGIC, USE_VERSION, m->slots, m->attrs, m->fouts};
     plat_file_write_atomic(p, f, sizeof f);
     AcquireSRWLockExclusive(&cache_lock);
@@ -1057,8 +1129,8 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
     rt_sha256(buf, (size_t)(p - buf), key);
 }
 
-static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const char *out,
+                            const uint8_t *c1, uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
@@ -1111,7 +1183,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
     if (host_sbuf) o += sprintf(o, ",\"sbuf_align\":%u", host_sbuf);
     if (host_sg[si] != 32) o += sprintf(o, ",\"subgroup\":%u", host_sg[si]);
     o += sprintf(o, "},\"out\":\"");
-    json_esc(&o, cache_dir);
+    json_esc(&o, out);
     o += sprintf(o, "\"}");
     return (size_t)(o - o0);
 }
@@ -1235,13 +1307,13 @@ typedef struct {
 static void in_path(const uint8_t iid[32], char *p) {
     char hex[65];
     key_hex(iid, hex);
-    snprintf(p, PATH_CAP + 80, "%s\\in\\%s.in", cache_dir, hex);
+    in_loose_path(hex, p);
 }
 
 // Stores the inputs of a translation unless they are stored already; the file appears whole (written, then renamed).
 static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, const uint8_t *code, const Req *r,
                      const GfxShaderAnswers *a) {
-    char p[PATH_CAP + 80], tmp[PATH_CAP + 120];
+    char p[PATH_CAP + 80], hex[65];
     in_path(iid, p);
     if (pack_find(PACK_IN, iid) || file_exists(p)) return;
     GfxShaderAnswers zero = {0};
@@ -1254,8 +1326,8 @@ static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, c
     memcpy(o, control, CONTROL_SIZE), o += CONTROL_SIZE;
     memcpy(o, code, r->length), o += r->length;
     if (r->c1_len) memcpy(o, r->c1, r->c1_len);
-    snprintf(tmp, PATH_CAP + 120, "%s\\in", cache_dir);
-    mkdir_p(tmp);
+    key_hex(iid, hex);
+    shard_make(1, hex);
     plat_file_write_atomic(p, buf, n);
     free(buf);
 }
@@ -1297,17 +1369,18 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     if (look && (s = disk_load(look, look_iid))) return InterlockedIncrement64(&n_hits), mem_insert(s);
 
     uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
-    char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
+    char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80], out_dir[PATH_CAP + 80];
     key_hex(key, hex);
-    mkdir_p(cache_dir);
-    snprintf(code_path, PATH_CAP + 80, "%s\\%s.code", cache_dir, hex);
-    snprintf(spv_path, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
-    snprintf(res_path, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, hex);
+    shard_make(0, hex);
+    shard_dir(0, hex, out_dir);                            // the translator writes <out>/<key>.spv and .res.json
+    loose_path(hex, ".code", code_path);
+    loose_path(hex, ".spv", spv_path);
+    loose_path(hex, ".res.json", res_path);
     if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
     size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
+    build_request(req, hex, r->stage_name, code_path, out_dir, r->c1, r->c1_len, a, control);
     int ok = svc_request(req, reply, sizeof reply);
     free(req);
     plat_file_delete(code_path);
@@ -1323,9 +1396,10 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         build_key(r->code_hash, a, &m, mk, miid);
         char mhex[65], to[PATH_CAP + 80];
         key_hex(mk, mhex);
-        snprintf(to, PATH_CAP + 80, "%s\\%s.spv", cache_dir, mhex);
+        shard_make(0, mhex);
+        loose_path(mhex, ".spv", to);
         int moved = plat_file_replace(spv_path, to);
-        snprintf(to, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, mhex);
+        loose_path(mhex, ".res.json", to);
         moved = moved && plat_file_replace(res_path, to);
         if (moved) {
             use_store(r->code_hash, &m);
@@ -1567,7 +1641,7 @@ static DWORD WINAPI warm_worker(void *arg) {
             char hex[65], p[PATH_CAP + 80];
             key_of_input(iid, key);
             key_hex(key, hex);
-            snprintf(p, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
+            loose_path(hex, ".spv", p);
             if (pack_find(PACK_SPV, key) || file_exists(p)) InterlockedIncrement(&w->other_cached);
             else gfx_shader_load_input(iid, 1);
         }
@@ -1604,7 +1678,6 @@ static int in_collect(const char *file, void *ctx) {
 // The stored inputs not in named (sorted): ids parsed from the in/ file names.
 static size_t other_inputs(const uint8_t (*named)[32], size_t n_named, uint8_t (**out)[32]) {
     char dir[PATH_CAP + 80];
-    snprintf(dir, sizeof dir, "%s\\in", cache_dir);
     InList l = {.named = named, .n_named = n_named};
     char name[68];
     for (uint32_t i = 0; i < pack_n; i++) {   // the packed inputs, under the name their loose file would have
@@ -1613,7 +1686,10 @@ static size_t other_inputs(const uint8_t (*named)[32], size_t n_named, uint8_t (
         memcpy(name + 64, ".in", 4);
         if (!in_collect(name, &l)) break;
     }
-    plat_file_list(dir, ".in", in_collect, &l);   // in_store writes no loose file for a packed input: no duplicates
+    for (int sub = 0; sub < 256; sub++) {   // in_store writes no loose file for a packed input: no duplicates
+        snprintf(dir, sizeof dir, "%s\\in\\%02x", cache_dir, sub);
+        plat_file_list(dir, ".in", in_collect, &l);
+    }
     return *out = l.v, l.n;
 }
 
