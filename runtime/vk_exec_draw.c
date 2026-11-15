@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/vk_exec_draw.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; the viewport orientation follows the window origin mode; storage images a shader stores into are recorded as GPU writes; texture type answers carry the integer class of the format; mirror uses pass the bytes they bind (VK_MEM_USE); sampled views clamp to the ASTC levels decoded so far (VkTexImage.min_lod).
+// From fe3h-pc-recomp runtime/vk_exec_draw.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; the viewport orientation follows the window origin mode; storage images a shader stores into are recorded as GPU writes; texture type answers carry the integer class of the format; mirror uses pass the bytes they bind (VK_MEM_USE); sampled views clamp to the ASTC levels decoded so far (VkTexImage.min_lod); draws fetch the geometry stage (issue #18).
 // From totk-pc-recomp runtime/vk_exec_draw.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); renamed to fe3h; separable programs: BindProgram with a subset of stages (FE3H); bound handles become pool slots (FE3H uses several descriptor pools).
 // Draws, binds and dispatches of the Vulkan op-stream replay: the strong
 // vk_exec_op_draw behind vk_exec.c's weak hook. The bind ops fill the VkExec slots; a draw opens the pass, resolves the
@@ -38,6 +38,7 @@
 #define SUPPORT_BYTES 1408u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
+#define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
@@ -737,7 +738,7 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
     memset(a, 0, sizeof *a);
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
     else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
-    else
+    else if (st == NVN_STAGE_CS)
         for (int k = 0; k < 3; k++) {
             uint32_t l;
             memcpy(&l, ctl + 0x748 + 4 * k, 4);
@@ -801,7 +802,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
             return set[0].s;
         }
     }
-    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : GFX_STAGE_CS;
+    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : st == NVN_STAGE_GS ? GFX_STAGE_GS : GFX_STAGE_CS;
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
@@ -819,7 +820,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
 // ---- descriptors
 
 static int nvn_stage_of(int gfx_stage) {
-    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS : NVN_STAGE_CS;
+    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS
+         : gfx_stage == GFX_STAGE_GS ? NVN_STAGE_GS : NVN_STAGE_CS;
 }
 
 static VkDescriptorBufferInfo zero_info(uint64_t max) {
@@ -2105,7 +2107,7 @@ typedef struct {
     uint64_t tex[2][32], img[2][32];
     VkPipeState pipe;
 } MemoKey;
-static struct { int on, valid, has_fs; MemoKey k; const GfxShader *vs, *fs; } SM = {-1};
+static struct { int on, valid, has_fs, has_gs; MemoKey k; const GfxShader *vs, *fs, *gs; } SM = {-1};
 
 static void memo_key(const VkExec *ex, uint32_t gen, MemoKey *k) {
     k->prog = ex->prog, k->serial = ex->prog->serial, k->gen = gen, k->tex_serial = ex->tex_serial;
@@ -2156,39 +2158,65 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     VkRect2D sc = vk_exec_scissor(ex);
     if (!sc.extent.width || !sc.extent.height) return 0;
     if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
-    int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = shader_memo_on();
-    const GfxShader *vs, *fs;
+    int has_vs, has_fs, has_gs, vs_wait = 0, fs_wait = 0, gs_wait = 0, memo = shader_memo_on();
+    const GfxShader *vs, *fs, *gs;
     uint32_t gen = memo ? vk_texture_slots_gen() : 0;   // before shader_for, whose lookups may bump it
     if (memo && SM.valid && memo_match(ex, gen, &SM.k)) {
-        vs = SM.vs, fs = SM.fs, has_vs = 1, has_fs = SM.has_fs;
+        vs = SM.vs, fs = SM.fs, gs = SM.gs, has_vs = 1, has_fs = SM.has_fs, has_gs = SM.has_gs;
         if (memo == 2) {
-            int hv, hf, wv, wf;
+            int hv, hf, hg, wv, wf, wg;
             const GfxShader *v2 = shader_for(ex, NVN_STAGE_VS, &hv, &wv, 0), *f2 = shader_for(ex, NVN_STAGE_FS, &hf, &wf, 0);
-            if (v2 != vs || f2 != fs || hf != has_fs || wv || wf)
+            const GfxShader *g2 = shader_for(ex, NVN_STAGE_GS, &hg, &wg, 0);
+            if (v2 != vs || f2 != fs || g2 != gs || hf != has_fs || hg != has_gs || wv || wf || wg)
                 rt_fatal("vk_exec: shader memo of program %llu differs from the lookup", (unsigned long long)ex->prog->serial);
         }
     } else {
         SM.valid = 0;
         vs = shader_for(ex, NVN_STAGE_VS, &has_vs, &vs_wait, 0);
         fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
-        if (memo && vs && !vs_wait && !fs_wait && (!has_fs || fs))
-            memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.has_fs = has_fs, SM.valid = 1;
+        gs = shader_for(ex, NVN_STAGE_GS, &has_gs, &gs_wait, 0);
+        if (memo && vs && !vs_wait && !fs_wait && !gs_wait && (!has_fs || fs) && (!has_gs || gs))
+            memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.gs = gs, SM.has_fs = has_fs, SM.has_gs = has_gs, SM.valid = 1;
     }
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
-    if (vs_wait || fs_wait) {
+    if (vs_wait || fs_wait || gs_wait) {
         if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
         perf_count(PERF_CNT_ONESHOT_WAIT);
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+        if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
     }
-    if (!vs || (has_fs && !fs)) return 0;
+    if (!vs || (has_fs && !fs) || (has_gs && !gs)) return 0;
+    // A geometry stage (issue #18): the game renders its environment probes as cube maps in one draw each, a
+    // geometry shader sending every triangle to its face's layer; without it all six faces land in layer 0 and the
+    // surfaces lit from the other five lose their shading. The translator declares triangle input (Program.cs
+    // QueryGraphicsState), so a geometry stage is used for triangle draws; other draws keep the vertex and fragment
+    // stages. Its constant buffers (the faces' matrices) bind like the other stages' (vk_pipeline.c pipe_miss). Inside
+    // a transform feedback bracket it is the stage captured, as on Maxwell: the CPU reads back what it writes.
+    if (gs) {
+        VkPrimitiveTopology t = vk_pipeline_topology(prim);
+        int tri = t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                  t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+        if (!tri) {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 5)
+                rt_log("vk_exec: program %llu: geometry stage left out (not a triangle draw): drawn with its vertex and "
+                       "fragment stages", (unsigned long long)ex->prog->serial);
+            gs = NULL;
+        } else {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 5)
+                rt_log("vk_exec: program %llu: drawn with its geometry stage (%u layers%s)", (unsigned long long)ex->prog->serial,
+                       ex->pass_layers, ex->xfb_active ? ", captured by transform feedback" : "");
+        }
+    }
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
-    s.vs = vs, s.fs = fs;
+    s.vs = vs, s.fs = fs, s.gs = gs;
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
     s.prim = (uint8_t)prim;
     s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);

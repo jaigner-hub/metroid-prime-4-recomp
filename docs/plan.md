@@ -175,7 +175,8 @@ the null decoder). No host AAC decoder needed.
   float of its c3 block, 0.031 at frame 7200 with `MP4_DUMP_UBO=1`) is live, fed by the 1x1 luminance reduction,
   two vertex-shader passes over storage buffers and a 64-byte copy the CPU reads back.
 - Transform feedback is replayed (VK_EXT_transform_feedback). Every ~245 frames the game binds a 1 MiB buffer,
-  begins, draws four rasterizer-discard triangle lists with a vertex-only program that transforms positions
+  begins, draws four rasterizer-discard triangle lists with a program that transforms positions (one of them has a
+  geometry stage, missed until issue #18; "Geometry stages" below)
   (gl_Position gets (0, 0, 0, 1), location 0 the world-space vertex), ends, and reads the buffer back on the CPU;
   with the bracket dropped it read whatever the buffer held. The capture layout is not in the program's control
   section: the fields that differ between programs (dword 0x7f8 and the bytes at 0x804) are a vertex attribute order
@@ -577,11 +578,32 @@ the null decoder). No host AAC decoder needed.
     first boot after the update spends about 6 s reading the stored inputs once). The 70 s run built 0 pipelines in
     play and skipped 0 draws (9 and 7 without the aliases). Private memory at the end: 10,174 MiB against 11,981.
     The last frame rendered correctly. Not yet played by hand where the flashes were reported (Fury Green).
-  - The other half of the issue (surfaces dark or flat at certain spots, also #15 by its description): the runtime
-    never builds a program's geometry stage, and the game renders its environment probe cube maps in one draw whose
-    geometry shader routes each face to its layer, so five faces stay stale (daninthemix's analysis there, not yet
-    reproduced here). Next: fetch NVN stage 2 in `vk_exec_draw.c` shader_for, a `gs` in the pipeline state and key, and
-    full pipelines (no stage libraries) for programs with one.
+- Geometry stages (issue #18, second half, 2026-11-15). The runtime fetched only a program's vertex and fragment
+  stages. daninthemix found that the game renders its environment probes as 6-layer cube maps in one draw each, a
+  geometry shader sending every triangle to its face's layer; without it all six faces land in layer 0 and surfaces
+  lit from the probe lose their shading at certain spots (also #15 by its description). The RomFS holds 14 geometry
+  programs (control +0x714 = 2, `tools/shader_inventory.py` now maps it to GFX_STAGE_GS): none passthrough (SPH word
+  0 bit 24, which would need VK_NV_geometry_shader_passthrough), 11 with triangle strip output of 3 vertices, 3 with
+  point output of 1, so the translator needs no change.
+  - `vk_exec_draw.c` prepare_draw fetches NVN stage 2 (in the shader memo, with the one-shot wait) and uses it for
+    triangle draws: `Program.cs` declares triangle input. Other draws keep their vertex and fragment stages (logged).
+  - `VkPipeState.gs`, last, so `pipeline-keys.bin` records keep the bytes before it (KeyRec stays 424 bytes;
+    geometry pipelines are not recorded). The key holds it; such a pipeline is built whole (no stage libraries) with
+    one shared set even with independent layouts: the vertex stage's bindings, the geometry stage's (renumbered,
+    `gs_offset`), the fragment stage's. The game's geometry shaders read constant buffers (c3 and c4 in program 118),
+    which bind through `nvn_stage_of` like the other stages'.
+  - The first geometry program met is not a probe: program 118 is one of the transform feedback capture draws read
+    back by the CPU (above, "Transform feedback is replayed", taken then for a vertex-only program). On Maxwell the
+    capture takes the last stage before the rasterizer, so the layout now goes on the geometry module
+    (`spirv_add_xfb`): 4 outputs at stride 44 (vec3, vec2, vec4, vec2), where the vertex-only capture wrote one vec3
+    at stride 12 and the CPU read those records as 44-byte ones.
+  - `spirv_fixup` dropped the unused CullDistance member of one gl_PerVertex struct; a geometry shader has two
+    (gl_in and its output), and with one fixed the validation layer reported a built-in block mismatch with the
+    vertex stage. Both are fixed now. Left in validation: ClipDistance 16 for the geometry stage, its input and output
+    arrays of 8 added together.
+  - Checked: the self-test and `--probe-vkexec` pass; scripted runs with the save draw program 118 through its
+    geometry stage, end cleanly, and the last frame renders as before. Not yet seen: a probe cube draw (none in the
+    save's area), so the dark spots of #18 and #15 are untested; Fury Green, where they were reported, is the test.
 - Crash after the grapple (issue #21, 2026-11-15, not fixed). `vk: staging buffer of 57081856 bytes failed (-2)` after
   about two hours of play: `memory commit: this process 32725 MB, the system 43392 of 44220 MB`, the Windows commit
   limit reached (a 6 GB GTX 1060, the reporter of #16). The log is from 0.4.7 to 0.4.14. Leads, not verified:

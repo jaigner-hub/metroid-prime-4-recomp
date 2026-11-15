@@ -14,7 +14,7 @@ Where the programs are (found 2026-11-04, docs/plan.md "Shader preparation"):
   frame's offset gives the base the offsets count from. A decoded entry holds one or more programs: their code blocks
   (each headed by 0x12345678) one after another, then one 0x880-byte NVN control section (0x98761234) per block, in the
   same order. Control +0x700 is the c1 offset in the code, +0x704 the code length, +0x714 the stage (0 vertex,
-  1 fragment).
+  1 fragment, 2 geometry).
 - `NVN2` (MaterialArchive.arc) and `SDX ` (DXBC) chunks hold the same shaders for other targets; the Switch 1 build does
   not use them.
 
@@ -32,7 +32,7 @@ CONTROL = 0x880
 CODE_MAGIC = b'\x78\x56\x34\x12'
 CONTROL_MAGIC = b'\x34\x12\x76\x98'
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
-STAGES = {0: 0, 1: 4}            # control +0x714 -> runtime/gfx.h GFX_STAGE_VS, GFX_STAGE_FS
+STAGES = {0: 0, 1: 4, 2: 3}      # control +0x714 -> runtime/gfx.h GFX_STAGE_VS, GFX_STAGE_FS, GFX_STAGE_GS
 UNKNOWN_STAGE = (0, 4, 5)        # another value: every translated stage is tried (its hash names the stage)
 SHADER_ASSETS = (b'MTRL', b'SVGM')
 

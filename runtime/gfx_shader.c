@@ -636,7 +636,8 @@ static int reflection_valid(const char *res, uint64_t size) {
     const char *st = strstr(b, "\"stage\"");
     if (!st) return 0;
     st = strchr(st + 7, '"');
-    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
+    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4) ||
+                  !strncmp(st, "\"gs\"", 4));
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -867,7 +868,8 @@ static void reflect(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS
+             : !strcmp(stage, "gs") ? GFX_STAGE_GS : GFX_STAGE_VS;
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
@@ -1218,7 +1220,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
        ae8f4f4). Without it a shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test
        after the depth prepass fails along contour lines. Already part of the code hash (the whole control section). */
     if (!strcmp(stage, "ps") && (control[0x718] & 1)) o += sprintf(o, ",\"early_fragment_tests\":true");
-    int si = !strcmp(stage, "vs") ? 0 : !strcmp(stage, "cs") ? 2 : 1;   // gfx_shader_set_host answers
+    int si = !strcmp(stage, "vs") || !strcmp(stage, "gs") ? 0 : !strcmp(stage, "cs") ? 2 : 1;   // gfx_shader_set_host answers
     if (!host_f64) o += sprintf(o, ",\"softfloat64\":true");
     if (host_sbuf) o += sprintf(o, ",\"sbuf_align\":%u", host_sbuf);
     if (host_sg[si] != 32) o += sprintf(o, ",\"subgroup\":%u", host_sg[si]);
@@ -1287,7 +1289,8 @@ typedef struct {
 
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs"
+                  : stage == GFX_STAGE_GS ? "gs" : NULL;   // the translator reads the stage from the SPH; "gs" names it back
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     uint32_t c1_off;
     memcpy(&c1_off, control + 0x700, 4), memcpy(&r->length, control + 0x704, 4);

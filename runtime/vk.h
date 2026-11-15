@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/vk.h @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; declares vk_mem_newer_pages; VK_MEM_USE and VK_MEM_PICK take the bytes used.
+// From fe3h-pc-recomp runtime/vk.h @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; declares vk_mem_newer_pages; VK_MEM_USE and VK_MEM_PICK take the bytes used. VkPipeState.gs (issue #18).
 // From totk-pc-recomp runtime/vk.h @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Vulkan-internal header of the graphics layer. Host code only; the guest never sees it.
 #pragma once
@@ -434,6 +434,9 @@ typedef struct VkPipeState {
     ds_st ds;
     uint32_t vattr[16];                    // OP_BIND_VATTR: va_st words; attribute i feeds vertex shader Location i
     vs_st vstream[16];                     // OP_BIND_VSTREAM
+    // Last, so pipeline-keys.bin records keep the bytes before it (vk_pipeline.c KeyRec): the program's geometry stage
+    // when the draw can take it (vk_exec_draw.c prepare_draw: triangle input), else NULL.
+    const GfxShader *gs;
 } VkPipeState;
 void vk_pipe_state_defaults(VkPipeState *s);   // NVN defaults of every state object (shaders and formats left 0)
 enum { VK_PIPE_SUPPORT = GFX_RES_KINDS };      // VkPipeBinding.kind of the support buffer

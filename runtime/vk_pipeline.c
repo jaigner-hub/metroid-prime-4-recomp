@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/vk_pipeline.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; the front face is mirrored for the lower-left window origin; --prepare-shaders also builds the pipelines of pipeline-keys.bin, except on a CPU device.
+// From fe3h-pc-recomp runtime/vk_pipeline.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; the front face is mirrored for the lower-left window origin; --prepare-shaders also builds the pipelines of pipeline-keys.bin, except on a CPU device.; graphics pipelines take a geometry stage (issue #18).
 // From totk-pc-recomp runtime/vk_pipeline.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Graphics and compute pipelines and descriptor layouts of the Vulkan replay. The op-stream replay (vk_exec.c)
 // collects NVN state into a VkPipeState and asks for the pipeline of each draw; this file maps that state to Vulkan,
@@ -46,6 +46,7 @@
 // (MIT, tools/vendor/ryujinx).
 #include <io.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -828,7 +829,8 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
 //    reports interlock support (SpirvGenerator.cs) and vk_device.c does not enable; kept when the shader interlocks;
 //  - the CullDistance[1] member of gl_PerVertex next to ClipDistance[8] (Declarations.cs CreatePerVertexStructType):
 //    9 distances exceed maxCombinedClipAndCullDistances (8 on the RX 9070). Ryujinx never accesses CullDistance; the
-//    member goes when it is the struct's last and no access chain selects it.
+//    member goes when it is the struct's last and no access chain selects it. A geometry shader has two such structs
+//    (gl_in and its output block), each fixed, so its input block still matches the vertex shader's output block.
 static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     enum { OP_EXTENSION = 10, OP_CAPABILITY = 17, OP_MEMBER_NAME = 6, OP_EXECUTION_MODE = 16, OP_TYPE_ARRAY = 28,
            OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_MEMBER_DECORATE = 72, OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66,
@@ -839,8 +841,10 @@ static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     uint32_t *val = calloc(bound, sizeof *val), *elem = calloc(bound, sizeof *elem), *len = calloc(bound, sizeof *len),
              *pointee = calloc(bound, sizeof *pointee), *var_type = calloc(bound, sizeof *var_type);
     uint32_t *o = NULL;
-    int interlock_used = 0, interlock_declared = 0, cull_ok = 0;
-    uint32_t cull_struct = 0, cull_member = 0, clip_member = ~0u, members = 0, member_types[8] = {0};
+    int interlock_used = 0, interlock_declared = 0, cull_ok = 0, ncs = 0;
+    struct { uint32_t id, cull, clip, members, types[8]; int used, ok; } cs[4];   // gl_PerVertex structs
+    memset(cs, 0, sizeof cs);
+    for (int k = 0; k < 4; k++) cs[k].clip = ~0u;
     if (!val || !elem || !len || !pointee || !var_type) goto out;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
@@ -854,24 +858,40 @@ static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         else if (op == OP_TYPE_ARRAY && l >= 4 && a[0] < bound) elem[a[0]] = a[1], len[a[0]] = a[2] < bound ? val[a[2]] : 0;
         else if (op == SPV_OP_TYPE_POINTER && l >= 4 && a[0] < bound) pointee[a[0]] = a[2];
         else if (op == SPV_OP_VARIABLE && l >= 4 && a[1] < bound) var_type[a[1]] = a[0] < bound ? pointee[a[0]] : 0;
-        else if (op == OP_MEMBER_DECORATE && l >= 5 && a[2] == SPV_DEC_BUILTIN && a[3] == BUILTIN_CULL) cull_struct = a[0], cull_member = a[1];
-        else if (op == OP_MEMBER_DECORATE && l >= 5 && a[2] == SPV_DEC_BUILTIN && a[3] == BUILTIN_CLIP) clip_member = a[1];
-        else if (op == OP_TYPE_STRUCT && cull_struct && a[0] == cull_struct && l >= 2) {
-            members = l - 2;
-            for (uint32_t m = 0; m < members && m < 8; m++) member_types[m] = a[1 + m];
-        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && cull_struct && a[2] < bound) {
-            uint32_t t = var_type[a[2]], k = 3;
-            if (t < bound && t && elem[t] == cull_struct) k = 4;   // arrayed per-vertex block
-            if ((t == cull_struct || k == 4) && k + 1 < l && a[k] < bound && val[a[k]] == cull_member) cull_struct = 0;
+        else if (op == OP_MEMBER_DECORATE && l >= 5 && a[2] == SPV_DEC_BUILTIN && (a[3] == BUILTIN_CULL || a[3] == BUILTIN_CLIP)) {
+            int k = 0;
+            while (k < ncs && cs[k].id != a[0]) k++;
+            if (k == ncs && ncs < 4) cs[ncs++].id = a[0];
+            if (k < ncs) {
+                if (a[3] == BUILTIN_CULL) cs[k].cull = a[1], cs[k].ok = 1;   // ok: has a CullDistance member (for now)
+                else cs[k].clip = a[1];
+            }
+        } else if (op == OP_TYPE_STRUCT && l >= 2) {
+            for (int k = 0; k < ncs; k++)
+                if (cs[k].id == a[0]) {
+                    cs[k].members = l - 2;
+                    for (uint32_t m = 0; m < cs[k].members && m < 8; m++) cs[k].types[m] = a[1 + m];
+                }
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && l >= 5 && a[2] < bound) {
+            uint32_t t = var_type[a[2]];
+            for (int k = 0; k < ncs; k++) {
+                uint32_t at = t && t < bound && elem[t] == cs[k].id ? 4 : 3;   // arrayed per-vertex block: index first
+                if ((t == cs[k].id || at == 4) && at + 1 < l && a[at] < bound && val[a[at]] == cs[k].cull) cs[k].used = 1;
+            }
         }
         i += l;
     }
     VkCtx *c = vk_ctx();
     uint32_t limit = c ? c->props.limits.maxCombinedClipAndCullDistances : 8;
-    if (cull_struct && members && members <= 8 && cull_member == members - 1 && clip_member < members) {
-        uint32_t clip_t = member_types[clip_member], cull_t = member_types[cull_member];
-        uint32_t clip_n = clip_t < bound ? len[clip_t] : 0, cull_n = cull_t < bound ? len[cull_t] : 0;
-        cull_ok = clip_n + cull_n > limit && clip_n <= limit;
+    for (int k = 0; k < ncs; k++) {
+        int ok = cs[k].ok && !cs[k].used && cs[k].members && cs[k].members <= 8 && cs[k].cull == cs[k].members - 1 &&
+                 cs[k].clip < cs[k].members;
+        if (ok) {
+            uint32_t clip_t = cs[k].types[cs[k].clip], cull_t = cs[k].types[cs[k].cull];
+            uint32_t clip_n = clip_t < bound ? len[clip_t] : 0, cull_n = cull_t < bound ? len[cull_t] : 0;
+            ok = clip_n + cull_n > limit && clip_n <= limit;
+        }
+        cs[k].ok = ok, cull_ok |= ok;
     }
     int strip = interlock_declared && !interlock_used;
     if (!strip && !cull_ok) goto out;
@@ -885,11 +905,16 @@ static uint32_t *spirv_fixup(const uint32_t *w, uint64_t n, uint64_t *out_n) {
         int drop = 0;
         if (strip && op == OP_CAPABILITY && (a[0] == CAP_PIXEL_INTERLOCK || a[0] == CAP_SAMPLE_INTERLOCK || a[0] == CAP_RATE_INTERLOCK)) drop = 1;
         if (strip && op == OP_EXTENSION && l >= 2 && !strncmp((const char *)a, "SPV_EXT_fragment_shader_interlock", (l - 1) * 4)) drop = 1;
-        if (cull_ok && (op == OP_MEMBER_DECORATE || op == OP_MEMBER_NAME) && l >= 3 && a[0] == cull_struct && a[1] == cull_member) drop = 1;
+        int shorten = 0;
+        for (int k = 0; k < ncs; k++) {
+            if (!cs[k].ok || a[0] != cs[k].id) continue;
+            if ((op == OP_MEMBER_DECORATE || op == OP_MEMBER_NAME) && l >= 3 && a[1] == cs[k].cull) drop = 1;
+            if (op == OP_TYPE_STRUCT) shorten = 1;
+        }
         if (!drop) {
             memcpy(o + on, w + i, l * 4);
-            if (cull_ok && op == OP_TYPE_STRUCT && a[0] == cull_struct) o[on] = (l - 1) << 16 | op;   // last member gone
-            on += op == OP_TYPE_STRUCT && cull_ok && a[0] == cull_struct ? l - 1 : l;
+            if (shorten) o[on] = (l - 1) << 16 | op;   // last member gone
+            on += shorten ? l - 1 : l;
         }
         i += l;
     }
@@ -1165,7 +1190,7 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 
 static VkShaderStageFlags stage_bit(int stage) {
     return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
-                                                                                      : VK_SHADER_STAGE_COMPUTE_BIT;
+         : stage == GFX_STAGE_GS ? VK_SHADER_STAGE_GEOMETRY_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
 // One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
@@ -1224,11 +1249,15 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
     return -1;
 }
 
+// Where a geometry stage's bindings start in its pipeline's shared set: after the vertex stage's (pipe_miss).
+static uint32_t gs_offset(const VkPipeState *s) { return binding_span(s->vs) - 1; }
+
 // Checks both stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
 static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off, char *why, size_t cap) {
     uint32_t nv = l->set1 ? l->n0 : l->n;
     int m = module_binding_missing(s->vs, l->b, nv, 0);
     const char *stage = "vertex";
+    if (m < 0 && s->gs) m = module_binding_missing(s->gs, l->b, l->n, gs_offset(s)), stage = "geometry";
     if (m < 0 && s->fs) {
         m = l->set1 ? module_binding_missing(s->fs, l->b + l->n0, l->n - l->n0, 0) : module_binding_missing(s->fs, l->b, l->n, fs_off);
         stage = "fragment";
@@ -1462,7 +1491,7 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
 // ---- graphics pipelines
 
 typedef struct {                       // normalized: zero where the state is dynamic or unused
-    const GfxShader *vs, *fs;
+    const GfxShader *vs, *fs, *gs;
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
@@ -1520,7 +1549,7 @@ uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i) { return target_w
 
 static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
-    k->vs = s->vs, k->fs = s->fs;
+    k->vs = s->vs, k->fs = s->fs, k->gs = s->gs;
     k->indep = (uint8_t)P.indep;
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
@@ -1590,7 +1619,28 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
     uint32_t *vpatched = NULL, *fpatched = NULL;
-    if (l->set1 && !vs_union_off()) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
+    VkShaderModule gm = VK_NULL_HANDLE;
+    if (s->gs) {   // vertex outputs feed the geometry stage, its outputs the fragment stage; neither is patched here
+        GfxShaderIo io[32];
+        uint32_t gin = gfx_shader_inputs(s->gs, io), vout = gfx_shader_outputs(s->vs, io);
+        uint32_t gout = gfx_shader_outputs(s->gs, io), fin = s->fs ? gfx_shader_inputs(s->fs, io) : 0;
+        if (gin & ~vout) LOG_ONCE("vk_pipeline: a geometry shader reads varyings %#x its vertex shader does not write", gin & ~vout);
+        if (fin & ~gout) LOG_ONCE("vk_pipeline: a fragment shader reads varyings %#x its geometry shader does not write", fin & ~gout);
+        uint64_t gw;
+        const uint32_t *gcode = gfx_shader_spirv(s->gs, &gw);
+        uint32_t *g2 = gcode && gs_offset(s) ? spirv_rebind(gcode, gw, gs_offset(s)) : NULL, *gx = NULL;
+        if (g2) gcode = g2;
+        else if (gs_offset(s)) gcode = NULL;   // out of memory: no pipeline rather than one reading the vertex stage's buffers
+        if (gcode && s->xfb) {   // the capture takes the last stage before the rasterizer: the geometry stage
+            uint64_t n2 = 0;
+            GfxXfbLayout xl;
+            if ((gx = spirv_add_xfb(gcode, gw, &n2, gfx_shader_xfb_layout(s->gs, &xl) ? &xl : NULL))) gcode = gx, gw = n2;
+            else LOG_ONCE("vk_pipeline: cannot add the transform feedback layout to the geometry shader");
+        }
+        if (gcode) am_label("gs", s->gs), gm = make_module(gcode, gw);
+        free(g2), free(gx);
+    }
+    if (l->set1 && !vs_union_off() && !s->gs) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
         if (missing) {
@@ -1602,7 +1652,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     if (s->fs) {
         GfxShaderIo fin[32], vout[32];
-        uint32_t need = gfx_shader_inputs(s->fs, fin), have = gfx_shader_outputs(s->vs, vout), missing = 0;
+        uint32_t need = s->gs ? 0 : gfx_shader_inputs(s->fs, fin), have = gfx_shader_outputs(s->vs, vout), missing = 0;
         for (int i = 0; i < 32; i++) {
             if (!(need >> i & 1) || fin[i].packed) continue;
             if (!(have >> i & 1)) missing |= 1u << i;
@@ -1631,7 +1681,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (fcode) am_label("fs", s->fs), fm = make_module(fcode, fw);
     }
     uint32_t *xpatched = NULL;
-    if (s->xfb) {   // a capture draw: the vertex shader carries the transform feedback layout
+    if (s->xfb && !s->gs) {   // a capture draw: the vertex shader carries the transform feedback layout
         uint64_t n2 = 0;
         GfxXfbLayout xl;
         if ((xpatched = spirv_add_xfb(vcode, vw, &n2, gfx_shader_xfb_layout(s->vs, &xl) ? &xl : NULL))) vcode = xpatched, vw = n2;
@@ -1649,16 +1699,25 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     vm = make_module(vcode, vw);
     free(vpatched), free(fpatched), free(xpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!vm || (s->fs && !fm)) goto out;
+    if (!vm || (s->fs && !fm) || (s->gs && !gm)) goto out;
 
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"},
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"}};
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
+    VkPipelineShaderStageCreateInfo stages[3] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"}};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq[3];
     uint64_t sw;
     const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
-    pin_subgroup32(&stages[0], &rqv, scode, sw);
-    if (s->fs) pin_subgroup32(&stages[1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
+    pin_subgroup32(&stages[0], &rq[0], scode, sw);
+    uint32_t n_stages = 1;
+    if (s->gs) {
+        stages[n_stages] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                              .stage = VK_SHADER_STAGE_GEOMETRY_BIT, .module = gm, .pName = "main"};
+        pin_subgroup32(&stages[n_stages], &rq[n_stages], gfx_shader_spirv(s->gs, &sw), sw), n_stages++;
+    }
+    if (s->fs) {
+        stages[n_stages] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                              .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"};
+        pin_subgroup32(&stages[n_stages], &rq[n_stages], gfx_shader_spirv(s->fs, &sw), sw), n_stages++;
+    }
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
@@ -1711,7 +1770,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .stageCount = s->fs ? 2 : 1, .pStages = stages, .pVertexInputState = &vi,
+                                       .stageCount = n_stages, .pStages = stages, .pVertexInputState = &vi,
                                        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
                                        .pDynamicState = &dy, .layout = l->layout};
@@ -1731,6 +1790,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
 out:
     if (vm) vkDestroyShaderModule(P.device, vm, NULL);
+    if (gm) vkDestroyShaderModule(P.device, gm, NULL);
     if (fm) vkDestroyShaderModule(P.device, fm, NULL);
     return pipe;
 }
@@ -2164,8 +2224,10 @@ typedef struct { char magic[8]; uint32_t version, rec_size; } KeysHeader;
 typedef struct {
     uint8_t vs[32], fs[32];            // gfx_shader_input_id of each stage; fs all zero with has_fs 0
     uint32_t has_fs, pad;
-    VkPipeState s;                     // vs, fs zero
+    uint8_t s[offsetof(VkPipeState, gs)];   // the VkPipeState up to gs, vs and fs zero (rec_fill); pipelines with a
+                                            // geometry stage are not recorded (keys_note)
 } KeyRec;
+_Static_assert(sizeof(KeyRec) == 424, "pipeline-keys.bin record size (tools/prepare_shaders.py KEY_REC)");
 static struct {
     char path[MAX_PATH * 2];
     int header_ok;                     // the file exists with our header: append
@@ -2218,14 +2280,15 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     memset(r, 0, sizeof *r);
     memcpy(r->vs, gfx_shader_input_id(s->vs), 32);
     if (s->fs) memcpy(r->fs, gfx_shader_input_id(s->fs), 32), r->has_fs = 1;
-    r->s = *s;
-    r->s.vs = r->s.fs = NULL;
-    r->s.prim_restart = 0;   // dynamic state: the same pipeline either way
+    VkPipeState c = *s;
+    c.vs = c.fs = NULL;
+    c.prim_restart = 0;   // dynamic state: the same pipeline either way
+    memcpy(r->s, &c, sizeof r->s);
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
 static void keys_note(const VkPipeState *s) {
-    if (!A.on || !K.path[0]) return;
+    if (!A.on || !K.path[0] || s->gs) return;   // a record names two stages; geometry pipelines are few and built at first use
     KeyRec r;
     rec_fill(&r, s);
     if (!seen_add(rec_hash(&r))) return;
@@ -2478,23 +2541,29 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     const char *why = NULL;
     Bindings B = {0};
     Layout *l = NULL;
-    uint32_t span = binding_span(s->vs);
-    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
+    // With a geometry stage the layout is shared even with independent layouts (the libraries hold no geometry stage):
+    // the vertex stage's bindings, then the geometry stage's from gs_offset(), then the fragment stage's from fs_off.
+    uint32_t span = binding_span(s->vs), fs_off = span - 1 + (s->gs ? binding_span(s->gs) - 1 : 0);
+    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) ||
+        (s->gs && gfx_shader_stage(s->gs) != GFX_STAGE_GS))
+        why = "stage mismatch";
     else if (k->topo_class == 3) why = "patches need tessellation stages, which are not translated";
-    else if (P.indep) {
+    else if (P.indep && !s->gs) {
         Bindings F = {0};
         if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) why = "too many bindings";
         else if (!(l = layout_pair(&B, &F))) why = "descriptor layout creation failed";
-        span = 1;
-    } else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1))) why = "too many bindings";
+        fs_off = 0;
+    } else if (!add_stage(&B, s->vs, 0) || (s->gs && !add_stage(&B, s->gs, span - 1)) ||
+               (s->fs && !add_stage(&B, s->fs, fs_off)))
+        why = "too many bindings";
     else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
     char lack[128];
-    if (!why && !layout_covers(s, l, span - 1, lack, sizeof lack)) why = lack, l = NULL;
+    if (!why && !layout_covers(s, l, fs_off, lack, sizeof lack)) why = lack, l = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
-        *j = (Job){.l = l, .fs_off = span - 1, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, span - 1))) {
+        *j = (Job){.l = l, .fs_off = fs_off, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
+    } else if (!why && !(pipe = create_graphics(s, k, l, fs_off))) {
         why = "pipeline creation failed";
     }
     if (why) {
@@ -2505,6 +2574,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         if (mode != 2) keys_note(s);
     }
     Pipe *p = pipe_add(k, sizeof *k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, gfx_shader_inputs(s->vs, NULL));
+    if (p && s->gs) p->fast_tried = 1;   // the libraries hold a vertex and a fragment stage only: built whole
     if (!j || !p) {
         free(j);
         return p;
@@ -2794,8 +2864,9 @@ static uint32_t prewarm_keys(int boot) {
             dropped++;
             continue;
         }
-        VkPipeState s = r[i].s;
-        s.vs = vs, s.fs = fs;
+        VkPipeState s;
+        memcpy(&s, r[i].s, sizeof r[i].s);
+        s.vs = vs, s.fs = fs, s.gs = NULL;
         GKey k;
         gkey_fill(&s, &k);
         pr_hist[(k.clamp & 1) | (k.poly_mode & 3) << 1 | (k.minus_w & 1) << 3]++;
