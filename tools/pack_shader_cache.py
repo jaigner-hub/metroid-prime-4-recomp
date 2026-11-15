@@ -26,7 +26,7 @@ MAGIC = b'TKSPACK1'
 PACK = 'shader-cache.pack'
 KINDS = {'.spv': 1, '.res.json': 2, '.use': 3, '.in': 4}
 NAME = re.compile(r'([0-9a-f]{64})(\.spv|\.res\.json|\.use|\.in)')
-USE_SIZE = 20   # gfx_shader.c use_store: magic, version, three masks
+USE_SIZES = (20, 28)   # gfx_shader.c use_parse: version 2 (three masks), version 3 (five)
 
 
 def folders(cache):
@@ -80,7 +80,7 @@ def read_pack(path):
 
 
 def valid(kind, data):
-    return len(data) == USE_SIZE if kind == 3 else len(data) > 0
+    return len(data) in USE_SIZES if kind == 3 else len(data) > 0
 
 
 def pack(cache, keep=False):

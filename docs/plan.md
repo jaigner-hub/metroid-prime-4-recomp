@@ -558,6 +558,41 @@ the null decoder). No host AAC decoder needed.
     world positions, objects popping in at the new edges if streaming or culling uses a fixed view, shadow cascades.
   - The same site gives ultrawide a widened view at the same vertical FOV, so res_wants_wide_overlay can then turn
     on the wide UI overlays instead of pillarboxing.
+- One-frame flashes: shader input ids keyed by images the shader never reads (issue #18, 2026-11-15). Cause found by
+  daninthemix in the issue. The use mask (`gfx_shader.c` UseMask) kept one set of slots for textures and images, so a
+  slot a shader only samples also keyed the image bound in that c2 slot: whatever storage image an earlier pass left
+  there made a new input id, a new translation and new pipelines, and draws waiting on them were skipped for a frame.
+  The dev cache held 45,458 variants of 3,027 shader codes; with the slots apart, 3,184 (the largest code went from
+  816 variants to 2). `pipeline-keys.bin` held 37,998 records for 3,761 distinct pipelines.
+  - `.use` version 3 keeps the sampled slots (texs, tex_type) and the image slots (imgs, img_type and img_format)
+    apart. A sampled slot keeps the image type only when it has no texture type, as the translator's
+    QuerySamplerType then reads the image type (Program.cs).
+  - Version 2 masks still load (use_parse), with both sets equal to the old union: the same ids as before, so every
+    cached shader is still found and nothing is translated again. The first shader found through such a mask stores
+    its exact mask (use_upgrade). `tools/pack_shader_cache.py` takes both sizes.
+  - The prewarm turns each recorded id into the shader the current masks give (load_canonical: the stored inputs
+    asked for again) and keeps old id -> new id in `shader-cache/in-aliases.bin`, so the release's pipeline list and
+    old `pipeline-keys.bin` records keep working without a format change.
+  - Dev build, same save and script: the prewarm built 36,000 pipelines in 2.9 s before, 1,991 in 1.2 s after (the
+    first boot after the update spends about 6 s reading the stored inputs once). The 70 s run built 0 pipelines in
+    play and skipped 0 draws (9 and 7 without the aliases). Private memory at the end: 10,174 MiB against 11,981.
+    The last frame rendered correctly. Not yet played by hand where the flashes were reported (Fury Green).
+  - The other half of the issue (surfaces dark or flat at certain spots, also #15 by its description): the runtime
+    never builds a program's geometry stage, and the game renders its environment probe cube maps in one draw whose
+    geometry shader routes each face to its layer, so five faces stay stale (daninthemix's analysis there, not yet
+    reproduced here). Next: fetch NVN stage 2 in `vk_exec_draw.c` shader_for, a `gs` in the pipeline state and key, and
+    full pipelines (no stage libraries) for programs with one.
+- Crash after the grapple (issue #21, 2026-11-15, not fixed). `vk: staging buffer of 57081856 bytes failed (-2)` after
+  about two hours of play: `memory commit: this process 32725 MB, the system 43392 of 44220 MB`, the Windows commit
+  limit reached (a 6 GB GTX 1060, the reporter of #16). The log is from 0.4.7 to 0.4.14. Leads, not verified:
+  `memory.c` mem_shadow_reserve commits each light-volume shadow whole and mem_shadow_release commits it again, and
+  committed pages count against the limit untouched (18 shadows, about 10 GB, early in that log); `vk_memory.c`
+  vk_staging could split a large upload instead of stopping; a commit line in the periodic memory census would show
+  the growth. The pipeline count above (#18) also lowers driver memory.
+- Desert stutter (issue #13, 2026-11-15): the attached log is from 0.4.3 or older; its 130-640 ms spikes are DualSense
+  reconnects, fixed in 0.4.6. The 16-33 ms frames are GPU-bound runs, guest CPU frames and ~100 ms fence waits with
+  VRAM near its budget. Between 0.4.7 and 0.4.11 the runtime changed only in the mouse gyro (inactive unless chosen)
+  and `--prepare-shaders` on CPU devices, so a second player's regression report needs logs from both versions.
 
 ## Shared core
 

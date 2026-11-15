@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/gfx_shader.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; integer textures are answered with _uint / _sint suffixes; loose cache files go in 256 subfolders (issue #11).
+// From fe3h-pc-recomp runtime/gfx_shader.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; integer textures are answered with _uint / _sint suffixes; loose cache files go in 256 subfolders (issue #11); texture and image slots apart in the use mask, with input aliases for the prewarm (issue #18).
 // From totk-pc-recomp runtime/gfx_shader.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Shader service client: turns an NVN program (control section, code, c1 constants and the
 // translator's answers) into SPIR-V plus reflection through `mp4_xlate.exe --serve` children, started lazily with
@@ -57,14 +57,18 @@
 #define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input)
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
-#define USE_VERSION 2                                      // 2: slots include the sampler format query (integer textures)
+#define USE_VERSION 3                                      // 2: slots include the sampler format query (integer textures);
+                                                           // 3: texture and image slots apart (issue #18)
 #define IN_MAGIC 0x49534b54u                               // "TKSI", .in files
 #define MAX_SVC 32                                         // translator processes
 
 typedef struct {                                           // which answers a shader's translation depends on
-    uint32_t slots;                                        // tex_type, img_type, img_format of these c2 slots
+    uint32_t slots;                                        // texs | imgs: the c2 slots whose types a draw gathers
     uint32_t attrs;                                        // attr_type (VS input Locations)
     uint32_t fouts;                                        // frag_out_type (FS output Locations)
+    uint32_t texs;                                         // tex_type of these slots (sampled: tex_queried)
+    uint32_t imgs;                                         // img_type and img_format of these (image ops: img_queried)
+    int legacy;                                            // read from a version 2 file, texs = imgs = slots (use_parse)
 } UseMask;
 
 typedef struct UseEnt {                                    // code hash -> use mask; known 0 caches a disk miss
@@ -893,7 +897,8 @@ static uint32_t json_slot_mask(const char *js, const char *name) {
 }
 
 static UseMask use_of(const GfxShader *s) {
-    UseMask m = {json_slot_mask(s->reflection, "tex_queried") | json_slot_mask(s->reflection, "img_queried"), 0, 0};
+    uint32_t t = json_slot_mask(s->reflection, "tex_queried"), i = json_slot_mask(s->reflection, "img_queried");
+    UseMask m = {t | i, 0, 0, t, i, 0};
     if (s->stage == GFX_STAGE_VS) m.attrs = s->in_mask;
     else if (s->stage == GFX_STAGE_FS) m.fouts = s->out_mask & 0xff;
     return m;
@@ -910,6 +915,23 @@ static void use_path_of(const uint8_t name[32], char *p) {
     char hex[65];
     key_hex(name, hex);
     loose_path(hex, ".use", p);
+}
+
+// A .use file: magic, version, slots, attrs, fouts and, from version 3, texs and imgs (28 bytes). A version 2 file (20
+// bytes) kept one mask for texture and image slots together, so a slot the shader only samples also keyed the image
+// bound there, which the translation never reads: every storage image an earlier pass left in that slot made a new
+// input id, a new translation and new pipelines, and the draws waiting on them were skipped for a frame (issue #18:
+// one fragment shader had 193 variants differing only in img_type). Such a mask is read with texs = imgs = slots,
+// which gives the input ids it gave before, so the shaders cached under it are still found; the first shader found
+// through it stores the exact mask (gfx_shader_get: use_upgrade).
+static int use_parse(const uint32_t *u, uint64_t len, UseMask *m) {
+    if (!u || len < 20 || u[0] != USE_MAGIC) return 0;
+    if (len == 28 && u[1] == USE_VERSION) {
+        *m = (UseMask){u[2], u[3], u[4], u[5], u[6], 0};
+        return (u[5] | u[6]) == u[2];
+    }
+    if (len == 20 && u[1] == 2) return *m = (UseMask){u[2], u[3], u[4], u[2], u[2], 1}, 1;
+    return 0;
 }
 
 // Every .use file of the cache, read by a background thread when the paths are set (use_preload), by file name: a
@@ -933,17 +955,18 @@ static DWORD WINAPI use_preload(void *arg) {
     char pattern[PATH_CAP + 16], p[PATH_CAP + 80];
     int n = 0, bad = 0;
     for (uint32_t i = 0; i < pack_n; i++) {   // the packed masks; the loose files below add the masks found since
-        uint32_t u[5];
+        uint32_t u[7];
+        UseMask m;
         UseFile **slot, *x;
         if (pack_ix[i].kind != PACK_USE) continue;
-        if (pack_ix[i].size != sizeof u || !pack_read_at(pack_ix[i].offset, u, sizeof u) || u[0] != USE_MAGIC ||
-            u[1] != USE_VERSION) {
+        if (pack_ix[i].size > sizeof u || !pack_read_at(pack_ix[i].offset, u, pack_ix[i].size) ||
+            !use_parse(u, pack_ix[i].size, &m)) {
             bad++;
             continue;
         }
         if (!*(slot = use_file_slot(pack_ix[i].name)) && (x = malloc(sizeof *x))) {
             memcpy(x->name, pack_ix[i].name, 32);
-            x->next = NULL, x->m.slots = u[2], x->m.attrs = u[3], x->m.fouts = u[4];
+            x->next = NULL, x->m = m;
             *slot = x, n++;
         }
     }
@@ -965,11 +988,12 @@ static DWORD WINAPI use_preload(void *arg) {
                 if (ok) {
                     snprintf(p, sizeof p, "%s\\%02x\\%s", cache_dir, sub, fd.cFileName);
                     u = (uint32_t *)read_file(p, &len);
-                    ok = u && len == 20 && u[0] == USE_MAGIC && u[1] == USE_VERSION;
+                    ok = use_parse(u, len, &e.m);
                 }
                 UseFile **slot = ok ? use_file_slot(e.name) : NULL, *x;
-                if (slot && !*slot && (x = malloc(sizeof *x))) {
-                    e.m.slots = u[2], e.m.attrs = u[3], e.m.fouts = u[4];
+                if (slot && *slot && (*slot)->m.legacy && !e.m.legacy) {   // an upgraded mask over the pack's old one
+                    (*slot)->m = e.m;
+                } else if (slot && !*slot && (x = malloc(sizeof *x))) {
                     *x = e, *slot = x, n++;
                 } else if (!ok) {
                     bad++;
@@ -1023,9 +1047,12 @@ static int use_find(const uint8_t h[32], UseMask *m) {
         use_path_of(name, p);
         uint64_t n = 0;
         uint32_t *f = (uint32_t *)pack_read(PACK_USE, name, &n);
-        if (!f) f = (uint32_t *)read_file(p, &n);
-        known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
-        if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
+        known = use_parse(f, n, m);
+        if (!known || m->legacy) {                         // a loose file may hold the upgraded mask
+            UseMask lm;
+            free(f), f = (uint32_t *)read_file(p, &n);
+            if (use_parse(f, n, &lm) && (!known || !lm.legacy)) *m = lm, known = 1;
+        }
         free(f);
     }
     AcquireSRWLockExclusive(&cache_lock);
@@ -1041,11 +1068,18 @@ static void use_store(const uint8_t h[32], const UseMask *m) {
     key_hex(name, hex);
     shard_make(0, hex);
     use_path_of(name, p);
-    uint32_t f[5] = {USE_MAGIC, USE_VERSION, m->slots, m->attrs, m->fouts};
+    uint32_t f[7] = {USE_MAGIC, USE_VERSION, m->slots, m->attrs, m->fouts, m->texs, m->imgs};
     plat_file_write_atomic(p, f, sizeof f);
     AcquireSRWLockExclusive(&cache_lock);
     use_put(h, 1, m);
     ReleaseSRWLockExclusive(&cache_lock);
+}
+
+// A shader found through a version 2 mask: store its exact mask (use_parse). Its reflection names the slots it
+// samples and the ones it uses as images; later requests key by that mask.
+static void use_upgrade(const uint8_t h[32], const GfxShader *s) {
+    UseMask m = use_of(s);
+    use_store(h, &m);
 }
 
 static void put_u32(uint8_t **p, uint32_t v) { memcpy(*p, &v, 4), *p += 4; }
@@ -1087,7 +1121,13 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     memset(o, 0, sizeof *o);
     if (!a) return;
     for (int i = 0; i < 32; i++) {
-        if (m->slots >> i & 1) o->tex_type[i] = a->tex_type[i], o->img_type[i] = a->img_type[i], o->img_format[i] = a->img_format[i];
+        if (m->texs >> i & 1) {
+            o->tex_type[i] = a->tex_type[i];
+            // with no texture type there, the translator's QuerySamplerType falls back to the slot's image type
+            // (Program.cs; build_request names tex only for a type in tex_names)
+            if (!(a->tex_type[i] & 0xf) || (a->tex_type[i] & 0xf) >= COUNT(tex_names)) o->img_type[i] = a->img_type[i];
+        }
+        if (m->imgs >> i & 1) o->img_type[i] = a->img_type[i], o->img_format[i] = a->img_format[i];
         if (m->attrs >> i & 1) o->attr_type[i] = a->attr_type[i];
     }
     for (int i = 0; i < 8; i++)
@@ -1242,6 +1282,7 @@ typedef struct {
     uint8_t key[32];                                       // cache key, or the provisional one with final 0
     uint8_t iid[32];                                       // input id with final 1
     int final;
+    int legacy;                                            // final through a version 2 mask (use_upgrade)
 } Req;
 
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
@@ -1259,6 +1300,7 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     paths();
     UseMask m;
     r->final = use_find(r->code_hash, &m);
+    r->legacy = r->final && m.legacy;
     build_key(r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
     return 1;
 }
@@ -1286,6 +1328,7 @@ const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t
     Req r;
     if (!req_init(&r, stage, control, code, code_size, c1, a)) return NULL;
     const GfxShader *s = get_one(&r, stage, control, code, a);
+    if (s && r.legacy) use_upgrade(r.code_hash, s);
     if (s) ans_note(&r, stage, control, code, a, s);
     return s;
 }
@@ -1494,6 +1537,7 @@ const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const u
     Req r;
     if (!req_init(&r, stage, control, code, code_size, NULL, a)) return NULL;
     const GfxShader *s = get_async_one(r, stage, control, code, a, pending);
+    if (s && r.legacy) use_upgrade(r.code_hash, s);
     if (s) ans_note(&r, stage, control, code, a, s);
     return s;
 }
@@ -1616,6 +1660,95 @@ void gfx_shader_release_private(const GfxShader *s) {
     if (s) shader_free((GfxShader *)s);
 }
 
+// ---- input aliases (<cache>\in-aliases.bin)
+// Pipeline key records (vk_pipeline.c) and the release's pipeline list name shaders by input id. The ids recorded under
+// version 2 use masks keyed the image bound in every slot a shader samples (use_parse), so many name variants a draw
+// no longer asks for: 37,998 records of a dev build named 3,761 pipelines once the ids were made exact. The prewarm
+// loads a recorded id's stored inputs and asks for the shader under the current mask (load_canonical), and keeps
+// id -> the id it got (often itself) here, so later boots skip the stored inputs. The file is per translator identity,
+// as masks are: magic, version, identity, then pairs of ids.
+#define ALIAS_MAGIC 0x41534b54u                            // "TKSA"
+#define ALIAS_VERSION 1
+typedef struct Alias { struct Alias *next; uint8_t from[32], to[32]; } Alias;
+static Alias *aliases[BUCKETS];
+static size_t n_aliases, n_aliases_new;
+static SRWLOCK alias_lock = SRWLOCK_INIT;
+
+static Alias **alias_slot(const uint8_t from[32]) {     // caller holds alias_lock
+    Alias **e = &aliases[(from[0] | from[1] << 8) % BUCKETS];
+    while (*e && memcmp((*e)->from, from, 32)) e = &(*e)->next;
+    return e;
+}
+
+static int alias_find(const uint8_t from[32], uint8_t to[32]) {
+    AcquireSRWLockShared(&alias_lock);
+    Alias *e = *alias_slot(from);
+    if (e) memcpy(to, e->to, 32);
+    ReleaseSRWLockShared(&alias_lock);
+    return e != NULL;
+}
+
+static void alias_put(const uint8_t from[32], const uint8_t to[32], int is_new) {
+    AcquireSRWLockExclusive(&alias_lock);
+    Alias **e = alias_slot(from);
+    if (!*e && (*e = calloc(1, sizeof **e))) {
+        memcpy((*e)->from, from, 32), memcpy((*e)->to, to, 32);
+        n_aliases++, n_aliases_new += is_new;
+    }
+    ReleaseSRWLockExclusive(&alias_lock);
+}
+
+static void aliases_path(char *p) { snprintf(p, PATH_CAP + 80, "%s\\in-aliases.bin", cache_dir); }
+
+static void aliases_load(void) {
+    static int loaded;
+    if (loaded++) return;
+    char p[PATH_CAP + 80];
+    aliases_path(p);
+    uint64_t len = 0;
+    uint8_t *f = read_file(p, &len);
+    uint32_t h[2];
+    if (f && len >= 40 && (len - 40) % 64 == 0 && (memcpy(h, f, 8), h[0] == ALIAS_MAGIC && h[1] == ALIAS_VERSION) &&
+        !memcmp(f + 8, xlate_id, 32))
+        for (uint64_t o = 40; o < len; o += 64) alias_put(f + o, f + o + 32, 0);
+    free(f);
+}
+
+static void aliases_save(void) {
+    if (!n_aliases_new) return;
+    AcquireSRWLockShared(&alias_lock);
+    size_t n = 40 + 64 * n_aliases;
+    uint8_t *f = malloc(n), *o = f;
+    if (f) {
+        uint32_t h[2] = {ALIAS_MAGIC, ALIAS_VERSION};
+        memcpy(o, h, 8), memcpy(o + 8, xlate_id, 32), o += 40;
+        for (int i = 0; i < BUCKETS; i++)
+            for (Alias *e = aliases[i]; e; e = e->next) memcpy(o, e->from, 32), memcpy(o + 32, e->to, 32), o += 64;
+    }
+    ReleaseSRWLockShared(&alias_lock);
+    if (!f) return;
+    char p[PATH_CAP + 80];
+    aliases_path(p);
+    if (plat_file_write_atomic(p, f, (size_t)(o - f))) n_aliases_new = 0;
+    rt_log("gfx_shader: %zu input aliases in %s", n_aliases, p);
+    free(f);
+}
+
+// The shader a recorded input id stands for under the current use masks (see "input aliases"). A get through a version 2
+// mask finds the shader the id was recorded for and upgrades the mask (use_upgrade); the second get then keys by the
+// exact mask. Without stored inputs the cached shader is taken as it is.
+static const GfxShader *load_canonical(const uint8_t iid[32]) {
+    uint8_t to[32];
+    if (alias_find(iid, to)) return gfx_shader_load_input(to, 1);
+    Inputs in;
+    if (!in_load(iid, &in)) return gfx_shader_load_input(iid, 1);
+    const GfxShader *s = gfx_shader_get(in.stage, in.control, in.code, in.length, in.c1, &in.a);
+    if (s && !memcmp(s->iid, iid, 32)) s = gfx_shader_get(in.stage, in.control, in.code, in.length, in.c1, &in.a);
+    free(in.buf);
+    if (s) alias_put(iid, s->iid, 1);
+    return s;
+}
+
 // ---- boot prewarm (gfx_shader_prewarm)
 
 typedef struct {
@@ -1634,7 +1767,7 @@ static DWORD WINAPI warm_worker(void *arg) {
         size_t i = (size_t)InterlockedIncrement64(&w->next) - 1;
         if (i >= w->n_named + w->n_other) return 0;
         if (i < w->n_named) {
-            if (!(w->out[i] = gfx_shader_load_input(w->named[i], 1))) InterlockedIncrement(&w->missing);
+            if (!(w->out[i] = load_canonical(w->named[i]))) InterlockedIncrement(&w->missing);
         } else {
             const uint8_t *iid = w->other[i - w->n_named];
             uint8_t key[32];
@@ -1699,6 +1832,7 @@ void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **o
     memset(out, 0, n * sizeof *out);
     if (!cache_dir[0]) return;
     uint64_t xl0 = (uint64_t)n_xlated, fail0 = (uint64_t)n_failures;
+    aliases_load();
     uint8_t (*sorted)[32] = n ? malloc(n * 32) : NULL;
     if (sorted) memcpy(sorted, iids, n * 32), qsort(sorted, n, 32, iid_cmp);
     Warm w = {.named = iids, .n_named = n, .out = out};
@@ -1721,6 +1855,7 @@ void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **o
     }
     for (int i = 0; i < k; i++) CloseHandle(t[i]);
     svc_set_limit(svc_runtime_limit());
+    aliases_save();
     rt_log("gfx_shader: prewarm: %zu shaders named by pipeline keys (%ld not available), %zu other stored inputs (%ld "
            "cached); %llu translated, %llu failed, with up to %d translators and %d threads, in %.0f ms", w.n_named,
            (long)w.missing, w.n_other, (long)w.other_cached, (unsigned long long)((uint64_t)n_xlated - xl0),
