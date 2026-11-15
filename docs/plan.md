@@ -521,6 +521,25 @@ the null decoder). No host AAC decoder needed.
     click, right click, Space, E, Ctrl/C. `binds_refresh` includes the mode, so switching it swaps the tables live.
   - Off by default, as the mouse does nothing in gyro mode until the game's own motion option is on. Played and
     confirmed by the user on the first area.
+- The 3D render scale at every game resolution (issue #19, 2026-11-15, 0.4.15). The docked resolution patch (set
+  `native4k` in `recomp/patches-v131072.txt`) was switched on only for `output_res = 3840x2160` with
+  `render_scale = 100`; every other combination kept the stock 1600x900, which players read as a setting that does
+  nothing. The patched sites take the render target, the half-size auxiliary targets, the viewport size and its
+  negated width from the patch page, so `game_patch_stubs.c` res_init now writes any size there: scene_size takes the
+  largest 16:9 rectangle inside `output_res` (a 21:9 output gets the 16:9 picture at its height, pillarboxed by the
+  present), times `render_scale`, the height rounded to a multiple of 4 so the half-size targets stay whole, at least
+  360 and at most 2160 (the game's heaps were grown for 4K and no further). res_sizes reports the scene size as the
+  game's output too, as the patch ties the UI to the render target: below 100 % the HUD is softer, as expected.
+  - Run in the first area with the save (`tools/run_game.py`, 65 s, shot at the end) for 3840x2160/100,
+    1920x1080/100, 2560x1440/75 (1920x1080), 1920x1080/67 (1288x724), 1280x720/50 (640x360), 1920x1080/200 and
+    3840x2160/150 (both 3840x2160, the second clamped), 3440x1440/100 (2560x1440), `game` and handheld (both
+    1600x900). Every log line matched, every run reached gameplay and exited cleanly, and each shot came out at the
+    scene size with the picture filling the frame, the HUD placed, and the visor frame, light shafts and shadows
+    aligned, the odd 1288x724 and the 640x360 floor included.
+  - Not covered by those runs: the present (the 200 % downscale, the 21:9 bars in a real window), the scan visor
+    overlay at an odd size (`res_scan_input` returns the pair to 1600x900 while ZL is held), morph ball, save and
+    load, pause menu, map and the cinematics. If an odd size breaks a post effect, round scene_size to a coarser step
+    (8 or 16) before dropping the scale.
 
 ## Shared core
 
