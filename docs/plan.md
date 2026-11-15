@@ -539,7 +539,7 @@ the null decoder). No host AAC decoder needed.
   negated width from the patch page, so `game_patch_stubs.c` res_init now writes any size there: scene_size takes the
   largest 16:9 rectangle inside `output_res` (a 21:9 output gets the 16:9 picture at its height, pillarboxed by the
   present), times `render_scale`, the height rounded to a multiple of 4 so the half-size targets stay whole, at least
-  360 and at most 2160 (the game's heaps were grown for 4K and no further). res_sizes reports the scene size as the
+  360 and at most 2160 (the largest size played; the game's heaps were not grown, issue #23). res_sizes reports the scene size as the
   game's output too, as the patch ties the UI to the render target: below 100 % the HUD is softer, as expected.
   - Run in the first area with the save (`tools/run_game.py`, 65 s, shot at the end) for 3840x2160/100,
     1920x1080/100, 2560x1440/75 (1920x1080), 1920x1080/67 (1288x724), 1280x720/50 (640x360), 1920x1080/200 and
@@ -643,6 +643,18 @@ the null decoder). No host AAC decoder needed.
   reconnects, fixed in 0.4.6. The 16-33 ms frames are GPU-bound runs, guest CPU frames and ~100 ms fence waits with
   VRAM near its budget. Between 0.4.7 and 0.4.11 the runtime changed only in the mouse gyro (inactive unless chosen)
   and `--prepare-shaders` on CPU devices, so a second player's regression report needs logs from both versions.
+- Crash at a ballistic cannon at 3840x2160 (issue #23, 2026-11-15, open). After the zone change's pool releases,
+  `nvn: MemoryPoolInitialize: pool without storage` (flags 0x22 or 0xa2, 0x3fc0000 or 0x7f80000 bytes), then an
+  access violation in the next texture call: the game's own allocator returned NULL and the game does not check.
+  main+0x185428 (called from main+0xf54740 with a scale in s0 from [x20+0x1a0]) sizes two sets of render targets as
+  that scale times the scene size, rounded to multiples of 4, and builds them through main+0x134850; one 3840x2160
+  target of 8 bytes per pixel is 0x3f48000, 0x3fc0000 aligned. So the cannon's targets are made at use, 5.76 times the
+  stock size at 4K, from a heap sized for 1600x900. The native4k patch set resizes the targets but no heap:
+  `res_heap_extra_kib`/`res_heap_extra_bytes` are FE3H stubs returning 0 here (FE3H grew a HeapDef table this game
+  lacks). The game takes the whole application pool at boot (SetHeapSize probes up to 0xca600000 of 0xcd500000), so a
+  larger `app_pool` may help if the exhausted heap scales with it; else cap the cannon's target size at
+  main+0x185428. Asked the reporter to try `app_pool = 0x100000000` (the guest heap is capped at 4 GiB, HEAP_CAP in
+  `runtime/memory.c`) and for a save before a cannon.
 
 ## Shared core
 
