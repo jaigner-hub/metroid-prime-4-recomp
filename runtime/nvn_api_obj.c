@@ -856,5 +856,6 @@ NVN_API(nvnQueuePresentTexture) {
     o->avail[idx] = slot + period;
     o->fence[idx] = nvn_fence_last();   // the frame rendered into this image was submitted before its present
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
+    fov_refresh();                           // fov.c: the field of view setting (live)
     rt_frame_presented(t, o->presents);
 }

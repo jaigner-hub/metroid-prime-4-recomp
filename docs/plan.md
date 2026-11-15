@@ -551,24 +551,32 @@ the null decoder). No host AAC decoder needed.
     overlay at an odd size (`res_scan_input` returns the pair to 1600x900 while ZL is held), morph ball, save and
     load, pause menu, map and the cinematics. If an odd size breaks a post effect, round scene_size to a coarser step
     (8 or 16) before dropping the scale.
-- Field of view (issue #20, 2026-11-15, not started). A player asked for an FOV setting. There is no camera patch yet:
-  `game_patch_stubs.c` res_wants_wide_overlay still returns 0, and a wider 21:9 picture is pillarboxed rather than
-  widened, for the same reason. The plan follows the render scale patch: find where the first-person camera's FOV
-  becomes a projection, change that load to read a factor from the patch page (a new set in
-  `recomp/patches-v131072.txt`), and expose it as `MP4_FOV` in `cfg.c` and the menu. A change at the FOV input, not
-  the matrix sent to the GPU, keeps whatever the engine works out from the camera (its frustum, culling, screen
-  projection of targets) consistent with the picture.
-  - Ways in, cheapest first: a tweak value in the RomFS (earlier Prime games keep the first-person FOV in tweak data),
-    which an overlay could change with no code patch; the conversion in `main` (degrees to radians, 0.0174533, times
-    half, then tan) traced back to the camera's FOV field; or the projection matrix found in a frame's uniform data
-    and its [0][0] write traced with `MP4_BREAK_WRITE`, as for the scanner (issue #10).
-  - Scale the FOV the game asks for by a factor rather than replacing it, so cutscene, morph ball and scripted
-    cameras keep their own views; or patch only the first-person camera's value.
-  - To check once it works: the arm cannon (drawn with the same projection, it may stretch or show where its model
-    ends; a separate projection for it is more work), the lock-on reticle, scan targets and HUD markers placed from
-    world positions, objects popping in at the new edges if streaming or culling uses a fixed view, shadow cascades.
-  - The same site gives ultrawide a widened view at the same vertical FOV, so res_wants_wide_overlay can then turn
-    on the wide UI overlays instead of pillarboxing.
+- Field of view (issue #20, 2026-11-15). `fov` in mp4.ini (`MP4_FOV`, live, also a Screen menu row): `game`, or the
+  horizontal field of view in degrees at 16:9, 90 to 120. The game's gameplay camera is 55 degrees vertical (about 86
+  horizontal), cutscenes and the title 30.
+  - Found at run time, not in data: a temporary host override of the SDK's tanf logged each caller with its argument
+    (half the FOV: 0.479966 at most sites). The busiest caller, main+0x4a820, builds a perspective projection from a
+    0x24-byte block (+0 type, +4 vertical FOV in radians, +8 aspect, +0x1c and +0x20 near and far). Its gameplay block
+    is copied each frame from a view object's +0x48, which main+0xb875c8 fills from the active camera's state
+    ([x0+8]: transform at +4, projection at +0x34) before building the view's frustum. `MP4_BREAK_WRITE` on the FOV
+    field and a logging memcpy followed the copies back to there. No FOV property name is in main (tweak properties are
+    hashed), so there was no data value to change.
+  - Set `fov` in `recomp/patches-v131072.txt`: after the copy at main+0xb87628 the view's FOV is multiplied by the patch
+    page's factor when it lies within 55 degrees +-2.5 %, so the frustum, the projection and the culling follow and the
+    30 degree cameras keep theirs. The band test is fcmge masks and bit, as a site may not touch flags its original does
+    not. `runtime/fov.c` writes the page from `MP4_FOV` at every present.
+  - The arm cannon and the HUD (with the visor's frame) are drawn by cameras of their own at 55 degrees, widened by the
+    same copy: the cannon shrank, the helmet's edges showed and the HUD moved in. Found by giving chosen projection
+    callers the original tangent back in the trace: main+0x131f9c and main+0x133690 build the cannon's projection (one
+    block, twice), main+0xd3211c and main+0xd32140 the HUD's. The first three restore the block's FOV before the call
+    (times 1/factor within the scaled band, which cannot overlap the unscaled one at factors above 1.051, so the cannon's
+    block is restored once); the HUD's second build reuses the restored block.
+  - Profile save, first area, 75 s runs at game, 90 and 110: the world widens, the cannon and HUD keep their size and
+    place. Wide settings show an orange shape at the lower right, most likely Samus's arm drawn with the world camera
+    (out of view at 55 degrees); the menu text says so. Not yet seen: cutscenes and the title (outside the band, so they
+    should keep 30), morph ball, the scan visor, the map, aiming and lock-on at wide settings.
+  - The same site would give ultrawide a wider view (a factor from the aspect ratio), so res_wants_wide_overlay could
+    then turn on the wide UI overlays instead of pillarboxing.
 - One-frame flashes: shader input ids keyed by images the shader never reads (issue #18, 2026-11-15). Cause found by
   daninthemix in the issue. The use mask (`gfx_shader.c` UseMask) kept one set of slots for textures and images, so a
   slot a shader only samples also keyed the image bound in that c2 slot: whatever storage image an earlier pass left

@@ -105,3 +105,24 @@ site native4k main 12d9e0 d100c3ff d65f03c0              # ret before the stack 
 
 # Use one atomic read for both dimensions of the scan effect. The game input path updates this pair when ZL is held.
 site native4k main 33150c 1a9f854a @page:x9 91010129 c8dffd29 d360fd2a 2a0903e9  # add x9, #0x40; ldar x9, [x9]; lsr x10, x9, #32; mov w9, w9
+
+# Field of view (issue #20). main+0xb875c8 copies a camera's state into its view each frame: the transform (0x30 bytes
+# from [x0+8]+4 to +0x18) and the projection (0x24 bytes from [x0+8]+0x34 to +0x48: type, vertical FOV in radians at
+# +0x4c, aspect, ..., near and far), then builds the view's frustum from them (tanf at main+0xb87640); the renderer's
+# projection (main+0x4a820, via main+0xe421e8) and its culling read the view. Gameplay runs at 55 degrees (0.959931),
+# cutscenes and the title at 30. After the copy the FOV is multiplied by the patch page's factor (+0x80) when it lies
+# within [+0x84, +0x88], so cameras outside that band keep theirs; the copy rewrites the field every frame, so the
+# factor never compounds. The band test is SIMD (fcmge masks, and, bit), as a patch site may not touch the flags its
+# original leaves alone. v0-v7 and x9 are free there: the memcpy call before clobbered them.
+set fov MP4_FOV_PATCH 0
+
+site fov main b87628 b9404a69 bd404e60 @page:x9 bd408121 bd408522 bd408923 1e210804 7e22e406 7e20e467 0e271cc6 2ea61c80 bd004e60 b9404a69  # ldr s0, fov; s4 = s0 * factor; s0 = s4 where lo <= s0 <= hi; str s0; the original ldr w9, [x19, #0x48]
+
+# The arm cannon and the HUD have cameras of their own at 55 degrees, copied the same way; widened, the cannon shrank,
+# the helmet showed at the screen's edges and the HUD moved in. Before their projections are built (main+0x4a820, x1 =
+# the view's +0x48) their FOV goes back: multiplied by 1/factor (+0x8c) when it lies within the scaled band
+# [+0x90, +0x94], which excludes the unscaled one (fov.c), so the cannon's two builds of one block (main+0x131f9c and
+# main+0x133690) restore it once. main+0xd32140 builds the HUD's block again after main+0xd3211c restored it.
+site fov main 131f9c 97fc6221 bd400420 @page:x9 bd408d21 bd409122 bd409523 1e210804 7e22e406 7e20e467 0e271cc6 2ea61c80 bd000420 97fc6221  # arm cannon: restore [x1+4], bl main+0x4a820
+site fov main 133690 97fc5c64 bd400420 @page:x9 bd408d21 bd409122 bd409523 1e210804 7e22e406 7e20e467 0e271cc6 2ea61c80 bd000420 97fc5c64  # arm cannon, the other path
+site fov main d3211c 97cc61c1 bd400420 @page:x9 bd408d21 bd409122 bd409523 1e210804 7e22e406 7e20e467 0e271cc6 2ea61c80 bd000420 97cc61c1  # HUD

@@ -267,6 +267,7 @@ void res_wanted(unsigned out[2]);                          // the output size MP
 // ---- code patches (patches.c) and the frame step (frame_rate.c)
 void rt_patches_init(void);                                // after ldr_load: switches from the environment, the patch
                                                            // page committed; logs the sets
+void fov_refresh(void);                                   // fov.c, at every present: MP4_FOV (live)
 int rt_patch_set(const char *name);                        // index of a set of generated patches.h, -1 if absent
 int rt_patch_enabled(int set);                             // the set is on (0 for -1)
 void rt_patch_disable(int set);                            // before the guest starts: a set needs another that is off

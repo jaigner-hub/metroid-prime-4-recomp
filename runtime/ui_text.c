@@ -70,6 +70,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT_DESC] = "When the window's shape differs from the game resolution's (a 16:9 picture on a 21:9 "
                             "screen): keep the picture's shape with black bars, or stretch it over the window.",
     [UI_MENU_ASPECT_FIT] = "Black bars", [UI_MENU_ASPECT_STRETCH] = "Stretch",
+    [UI_MENU_FOV] = "Field of view",
+    [UI_MENU_FOV_DESC] = "Horizontal field of view in gameplay, measured on a 16:9 picture. The arm cannon and the HUD keep "
+                         "their size; at wide settings part of Samus's arm can show at the screen's edge. Cutscenes keep "
+                         "theirs.",
+    [UI_MENU_FOV_GAME] = "Game (86°)",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
     [UI_MENU_SHARPNESS_DESC] = "Sharpening after FSR scaling; 0 turns it off.",
 
@@ -312,6 +317,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ASPECT_DESC] = "Когда форма окна отличается от разрешения игры (картинка 16:9 на экране 21:9): сохранить "
                             "форму картинки с чёрными полосами или растянуть её на всё окно.",
     [UI_MENU_ASPECT_FIT] = "Чёрные полосы", [UI_MENU_ASPECT_STRETCH] = "Растянуть",
+    [UI_MENU_FOV] = "Поле зрения",
+    [UI_MENU_FOV_DESC] = "Горизонтальное поле зрения в игре, для картинки 16:9. Пушка и интерфейс сохраняют размер; при "
+                         "широких значениях у края экрана может быть видна часть руки Самус. В роликах — как в игре.",
+    [UI_MENU_FOV_GAME] = "Как в игре (86°)",
     [UI_MENU_SHARPNESS] = "Резкость FSR",
     [UI_MENU_SHARPNESS_DESC] = "Повышение резкости после масштабирования FSR; 0 выключает его.",
 

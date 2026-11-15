@@ -450,6 +450,20 @@ static void row_render_scale(void) {
     opt_choice_list("MP4_RENDER_SCALE", UI_MENU_RENDER_SCALE, vals, names, N, UI_MENU_RENDER_SCALE_DESC);
 }
 
+// MP4_FOV: horizontal degrees at 16:9 (fov.c), live.
+static void row_fov(void) {
+    static const char *const vals[] = {"game", "90", "95", "100", "105", "110", "115", "120"};
+    enum { N = sizeof vals / sizeof *vals };
+    char shown[N][16];
+    const char *names[N];
+    names[0] = menu_text(UI_MENU_FOV_GAME);
+    for (int i = 1; i < N; i++) {
+        snprintf(shown[i], sizeof shown[i], "%s°", vals[i]);
+        names[i] = shown[i];
+    }
+    opt_choice_list("MP4_FOV", UI_MENU_FOV, vals, names, N, UI_MENU_FOV_DESC);
+}
+
 static void row_gpu(void) {
     const char *vals[MAX_GPUS + 1], *names[MAX_GPUS + 1];
     char idx[MAX_GPUS][4];
@@ -546,6 +560,7 @@ static void tab_screen(float scale) {
     opt_slider("MP4_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
     opt_choice("MP4_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
+    row_fov();
     opt_end();
 }
 

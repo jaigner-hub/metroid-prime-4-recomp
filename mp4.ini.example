@@ -26,6 +26,9 @@
 # gpu_index = 0
 # Anisotropic filtering for mipmapped world textures. game keeps the original filters. 2, 4, 8 and 16 apply after restart.
 # anisotropy = game
+# Horizontal field of view in gameplay, in degrees on a 16:9 picture: 90, 95, 100, 105, 110, 115 or 120 (live); game keeps
+# the original (55 vertical, about 86 horizontal). The arm cannon, the HUD and cutscenes keep theirs.
+# fov = game
 
 [language]
 # The game's language, a Switch language code: ja, en-US, en-GB, fr, fr-CA, de, it, es, es-419, zh-Hans, zh-Hant, ko
