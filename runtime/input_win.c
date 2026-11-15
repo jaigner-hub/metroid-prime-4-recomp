@@ -1,4 +1,4 @@
-// From fe3h-pc-recomp runtime/input_win.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only.
+// From fe3h-pc-recomp runtime/input_win.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; the mouse can aim through the gyro, alone while it does, and scripts can move it (issue #17).
 // From totk-pc-recomp runtime/input_win.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Host input for nn::hid (runtime/ov_input.c): an SDL3 gamepad (no SDL window, no SDL video), the keyboard and the mouse,
 // merged into Switch npad button bits and stick axes. Button order follows libnx HidNpadButton (ISC). The key and pad bindings
@@ -108,6 +108,11 @@ static const struct { const char *name; int bit; } script_buttons[] = {
 };
 static ScriptEv *script_ev;
 static int script_n, script_state;   // 0 not loaded, 1 loaded
+// "<tick> MOUSE <dx> <dy>": raw mouse counts added once at the tick to the gyro mouse aim's (mouse_gyro_take), as a
+// mouse that moved by that much; a script with such a line feeds the gyro without a captured cursor (MP4_MOUSE_AIM=gyro
+// and the game's own Motion controls still needed). For testing the aim (issue #17).
+static int script_mouse;
+static volatile LONG gyro_dx, gyro_dy;     // raw counts since the gamepad thread's last tick (mouse_gyro_take)
 static int script_mixed;             // the script has timed lines: its untimed ones end where the world clock starts
 
 static void script_load(void) {
@@ -146,6 +151,10 @@ static void script_load(void) {
             e.stick = name[0] == 'L' ? 1 : 2; e.x = (int32_t)a; e.y = (int32_t)b;
             if (n >= 3 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
             snprintf(e.text, sizeof e.text, "%s %d %d", name, e.x, e.y);
+        } else if (!strcmp(name, "MOUSE")) {
+            if (sscanf(line + off, "%ld %ld", &a, &b) != 2) { rt_log("input: script line %d: MOUSE needs dx dy", ln); continue; }
+            e.stick = 3, e.x = (int32_t)a, e.y = (int32_t)b, script_mouse = 1;
+            snprintf(e.text, sizeof e.text, "MOUSE %d %d", e.x, e.y);
         } else if (!strcmp(name, "SHOT") || !strcmp(name, "DUMP")) {
             e.host = name[0] == 'S' ? 1 : 2;
             snprintf(e.text, sizeof e.text, "%s", name);
@@ -191,6 +200,9 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
         if (e->host) {
             if (e->host == 1) rt_shot_ring_dump();
             else vk_dump_arm(fr + 2);
+            e->at = UINT64_MAX - e->hold;   // once
+        } else if (e->stick == 3) {
+            InterlockedAdd(&gyro_dx, e->x), InterlockedAdd(&gyro_dy, e->y);
             e->at = UINT64_MAX - e->hold;   // once
         } else if (e->stick) { int32_t *s = e->stick == 1 ? sl : sr; s[0] = e->x; s[1] = e->y; }
         else *b |= 1ull << e->bit;
@@ -371,7 +383,6 @@ uint32_t input_key_char(int key) {
 
 // ---- mouse camera: raw motion accumulated by the window thread, one stick sample per presented frame
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
-static volatile LONG gyro_dx, gyro_dy;     // raw counts since the gamepad thread's last tick (mouse_gyro_take)
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
 // Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
@@ -974,7 +985,7 @@ static int mouse_gyro_take(double out[3]) {
     if (dt > 0.05) dt = 0.004;
     last = now;
     int32_t dx = InterlockedExchange(&gyro_dx, 0), dy = InterlockedExchange(&gyro_dy, 0);
-    if (!cur_captured || !mouse_aim_gyro()) {
+    if ((!cur_captured && !script_mouse) || !mouse_aim_gyro()) {
         memset(rx, 0, sizeof rx), memset(ry, 0, sizeof ry), memset(rdt, 0, sizeof rdt);
         return 0;
     }
@@ -1034,11 +1045,16 @@ static DWORD WINAPI pad_main(void *arg) {
         }
         double acc[3], gyro[3] = {0, 0, 0}, mg[3];
         if (have) input_motion_axes(a, g, acc, gyro);
-        int mouse = mouse_gyro_take(mg);   // added to a real gyro; alone, held still in the estimated orientation
+        // While the mouse aims through the gyro, the mouse alone moves the sensor, held still in the estimated
+        // orientation (its own gravity fed back). A connected controller's sensors are left out then (issue #17: the aim
+        // drifted down with the mouse at rest): its accelerometer still reads it lying flat, so the fusion's gravity
+        // correction pulled every pitch the mouse made back toward level at 0.5/s, and its gyro's bias at rest added a
+        // slow turn of its own. With the cursor released the controller's motion counts as before.
+        int mouse = mouse_gyro_take(mg);
         if (!(have || mouse) || !input_motion_enabled()) continue;
         if (mouse) {
-            for (int j = 0; j < 3; j++) gyro[j] += mg[j];
-            if (!have) motion_gravity(motion_global(), acc);
+            memcpy(gyro, mg, sizeof gyro);
+            motion_gravity(motion_global(), acc);
         }
         motion_feed(motion_global(), acc, gyro, kern_now_ns());
     }

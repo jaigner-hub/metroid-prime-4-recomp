@@ -286,6 +286,12 @@ int probe_cfg(void) {
         motion_gravity(m, acc);
         CHECK(fabs(acc[1] + sin(0.4)) < 1e-3 && fabs(acc[2] + cos(0.4)) < 1e-3,
               "mouse gyro: fed back gravity keeps the integrated pitch");
+        // Why a controller's own accelerometer is left out while the mouse aims (input_win.c pad_main, issue #17): fed
+        // a flat reading after the mouse pitched, the gravity correction turns the pitch back toward level.
+        double still[3] = {0, 0, 0};
+        for (int i = 0; i < 500; i++) motion_feed(m, flat, still, t += 4000000);   // 2 s at rest
+        motion_gravity(m, acc);
+        CHECK(fabs(acc[1]) < sin(0.4) * 0.5, "mouse gyro: a flat accelerometer pulls a mouse pitch back (the drift of #17)");
     }
     input_pad_stick(3000, -2000, 0.15f, st);
     CHECK(st[0] == 0 && st[1] == 0, "pad stick: an 11% drift inside a 15% dead zone reads centred");

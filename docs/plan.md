@@ -522,6 +522,16 @@ the null decoder). No host AAC decoder needed.
     click, right click, Space, E, Ctrl/C. `binds_refresh` includes the mode, so switching it swaps the tables live.
   - Off by default, as the mouse does nothing in gyro mode until the game's own motion option is on. Played and
     confirmed by the user on the first area.
+  - Drift (2026-11-15): the reporter saw the aim sink slowly with the mouse at rest. With a controller connected,
+    pad_main fed its real gyro and accelerometer and added the mouse's rate: the accelerometer still read the
+    controller lying flat, so the fusion's gravity correction (Mahony, 0.5/s) turned every pitch the mouse made back
+    toward level, and the resting gyro's bias added a slow turn. While the mouse aims (mouse_gyro_take: gyro mode and
+    the cursor captured) the fusion now takes the mouse alone with its own gravity fed back; with the cursor released
+    the controller's motion counts as before. `--probe-cfg` checks the pull (a flat reading halves a 0.4 rad mouse
+    pitch within 2 s). Without a controller nothing drifted, so the fix assumes the reporter had one connected.
+  - `<tick> MOUSE <dx> <dy>` in an input script adds raw counts to the gyro aim, without a captured cursor. The
+    profile's save has the game's Motion controls off, so a scripted test turned nothing; the setting is in the
+    game's own options, not yet reached by a script.
 - The 3D render scale at every game resolution (issue #19, 2026-11-15, 0.4.15). The docked resolution patch (set
   `native4k` in `recomp/patches-v131072.txt`) was switched on only for `output_res = 3840x2160` with
   `render_scale = 100`; every other combination kept the stock 1600x900, which players read as a setting that does
