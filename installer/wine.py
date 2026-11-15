@@ -123,6 +123,24 @@ def _quote(s):
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
+def _launch_linux(args, env=None):
+    """Start a Linux program from under Wine and forget it. Wine starts it but has no Windows process for it: Popen
+    either raises ERROR_INVALID_HANDLE (6) or returns holding an invalid handle, and then the Popen's finalizer polls
+    and closes that handle and prints "Exception ignored ... [WinError 6] Invalid handle" tracebacks into the setup's
+    console (issue #11). Marking the Popen finished and its handle closed keeps the finalizer quiet. Returns False when
+    the program could not be started."""
+    try:
+        p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             env=env)
+    except OSError as e:
+        return getattr(e, 'winerror', None) == 6
+    p.returncode = 0
+    h = getattr(p, '_handle', None)
+    if h is not None and hasattr(h, 'closed'):
+        h.closed = True
+    return True
+
+
 class Tool:
     """A tool started through /bin/sh by start_tool. Its output goes to log (written by the shell, read by the caller);
     poll() is None while it runs, then its exit code."""
@@ -183,9 +201,8 @@ class Tool:
             subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.pid)], capture_output=True)
         elif self.upid_file.is_file():
             try:
-                subprocess.Popen(['/bin/sh', '-c', f'kill -9 {int(self.upid_file.read_text().strip())}'],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except (OSError, ValueError):
+                _launch_linux(['/bin/sh', '-c', f'kill -9 {int(self.upid_file.read_text().strip())}'])
+            except ValueError:
                 pass
 
     def cleanup(self):
@@ -221,11 +238,6 @@ def start_tool(command, log, cwd, env):
               + f' {_quote(loader)} {_quote(program)} ' + ' '.join(_quote(a) for a in command[1:])
               + f' >> {_quote(ulog)} 2>&1 < /dev/null & echo $! > {_quote(uupid)}; wait $!;'
               + f' echo $? > {_quote(udone)}')
-    try:
-        subprocess.Popen(['/bin/sh', '-c', script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, env=env)
-    except OSError as e:
-        # Wine starts a Linux program but returns no handle for it: ERROR_INVALID_HANDLE (6) means it is running.
-        if getattr(e, 'winerror', None) != 6:
-            return None
+    if not _launch_linux(['/bin/sh', '-c', script], env):
+        return None
     return tool
