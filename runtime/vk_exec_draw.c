@@ -2145,6 +2145,51 @@ static int pipe_memo_on(void) {
     return PM.on;
 }
 
+/* Issue #22: a pass is as large as its smallest attachment (vk_exec.c resolve_rt), as Vulkan requires; NVN draws each
+   target to its own size. A draw whose viewport reaches past a pass that a smaller attachment cut down loses the rest
+   of its larger targets: the suspect behind the bottom-left quarter that stays after a load. Logs each combination of
+   target sizes and formats once (up to 32), with the depth-stencil state and channel mask, which say whether the
+   smaller target is used at all. */
+static void note_clipped_pass(const VkExec *ex) {
+    if (ex->pass_noatt || !ex->has_vp) return;
+    double vx = fmax(ex->vp[0][0], ex->vp[0][0] + ex->vp[0][2]), vy = fmax(ex->vp[0][1], ex->vp[0][1] + ex->vp[0][3]);
+    if (vx <= ex->pass_w + 0.5 && vy <= ex->pass_h + 0.5) return;
+    uint32_t maxw = 0, maxh = 0;
+    uint64_t sig = 0xcbf29ce484222325ull;
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if ((i < 8 && (uint32_t)i >= ex->pass_ncolor) || !t->image) continue;
+        if (t->width > maxw) maxw = t->width;
+        if (t->height > maxh) maxh = t->height;
+        uint64_t v[] = {(uint64_t)i, t->width, t->height, (uint64_t)(uint32_t)t->nvn_format};
+        for (int k = 0; k < 4; k++) sig = (sig ^ v[k]) * 0x100000001b3ull;
+    }
+    if (maxw <= ex->pass_w && maxh <= ex->pass_h) return;   // the viewport overshoots every target: nothing is lost
+    static uint64_t seen[32];
+    static int nseen, full;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == sig) return;
+    if (nseen == 32) {
+        if (!full++) rt_log("vk_exec: clipped pass: more than 32 combinations, the others are not logged");
+        return;
+    }
+    seen[nseen++] = sig;
+    char buf[512];
+    int n = 0;
+    for (int i = 0; i < 9 && n < (int)sizeof buf - 48; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if ((i < 8 && (uint32_t)i >= ex->pass_ncolor) || !t->image) continue;
+        n += snprintf(buf + n, sizeof buf - n, " %s%d %ux%u fmt %d", i < 8 ? "c" : "d", i < 8 ? i : 0, t->width, t->height,
+                      t->nvn_format);
+        if (i < 8) n += snprintf(buf + n, sizeof buf - n, " mask %x", (ex->pipe.chmask.mask >> (4 * i)) & 0xf);
+    }
+    rt_log("vk_exec: clipped pass %ux%u, viewport %g,%g %gx%g, frame %llu, program %llu; depth test %d write %d, stencil "
+           "test %d; targets:%s",
+           ex->pass_w, ex->pass_h, ex->vp[0][0], ex->vp[0][1], ex->vp[0][2], ex->vp[0][3],
+           (unsigned long long)gfx_counters.frames, (unsigned long long)(ex->prog ? ex->prog->serial : 0),
+           (int)ex->pipe.ds.dt, (int)ex->pipe.ds.dw, (int)ex->pipe.ds.st, buf);
+}
+
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
@@ -2158,6 +2203,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
     vk_exec_pass_begin(ex);
+    note_clipped_pass(ex);
     VkRect2D sc = vk_exec_scissor(ex);
     if (!sc.extent.width || !sc.extent.height) return 0;
     if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
