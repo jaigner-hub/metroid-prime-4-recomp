@@ -291,8 +291,10 @@ int rt_knob(const char *name, const char *def);
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
 // ---- boot (boot.c, main.c)
-typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds; const char *shot, *gpu; } RtConfig;
+typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds; const char *shot, *gpu; int player; } RtConfig;
                                                            // romfs: directory with romfs.bin and index.json;
+                                                           // player: a player's start (no mode, no --seconds),
+                                                           // the one that may show message boxes;
                                                            // frames: --frames N (0 = no limit); shot: --shot
                                                            // PATH; gpu: MP4_GPU
 const RtConfig *rt_config(void);

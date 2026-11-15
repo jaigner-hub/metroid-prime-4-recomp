@@ -897,6 +897,7 @@ int main(int argc, char **argv) {
     log_open(!mode);
     if (!mode) {
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
+        cfg.player = !cfg.boot;
         rt_boot();
         return 0;
     }

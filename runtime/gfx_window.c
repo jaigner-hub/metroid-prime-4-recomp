@@ -27,6 +27,7 @@
 #include "flight.h"
 #include "fs.h"
 #include "gfx.h"
+#include "host.h"
 #include "input.h"
 #include "nvn_api.h"
 #include "ui/menu.h"
@@ -579,8 +580,53 @@ static void free_capture(void) {
     g_cap_valid = 0;
 }
 
-// Returns 1 with a usable swapchain, 0 when the window has no area (minimised). Called with g_pl held.
+// Failed vkCreateSwapchainKHR calls in a row (create_swapchain). Every present without a swapchain tries again, and each
+// try idles the device first: a failure that lasts (a GPU that cannot present to the window, such as the one of two
+// that no monitor is connected to, -3 under Proton on a PC whose monitors are on the other GPU) logged a line and
+// stalled the device every frame. Now the first failure is logged, then the 2nd, 4th, 8th, ... and the recovery; tries
+// are SC_RETRY_MS apart; and when there never was a swapchain after SC_GIVE_UP_MS the game stops and says why (a
+// message box on a player's start), as its window would stay black. Once a swapchain existed, it only keeps trying.
+#define SC_RETRY_MS 500
+#define SC_GIVE_UP_MS 10000
+static uint32_t g_sc_fails;
+static uint64_t g_sc_fail_first, g_sc_fail_next;   // GetTickCount64 of the first failure, of the next allowed try
+static int g_sc_made;                              // a swapchain was created at least once
+
+static void swapchain_failed(VkResult r, VkExtent2D ext, VkFormat fmt) {
+    VkCtx *c = vk_ctx();
+    uint64_t now = GetTickCount64();
+    if (!g_sc_fails++) {
+        g_sc_fail_first = now;
+        rt_log("gfx: vkCreateSwapchainKHR failed (%d) on %s for a %ux%u window, format %d; trying again every %d ms",
+               (int)r, c->props.deviceName, ext.width, ext.height, (int)fmt, SC_RETRY_MS);
+    } else if (!(g_sc_fails & (g_sc_fails - 1))) {
+        rt_log("gfx: vkCreateSwapchainKHR still failing (%d): %u tries in %.1f s", (int)r, g_sc_fails,
+               (now - g_sc_fail_first) / 1000.0);
+    }
+    g_sc_fail_next = now + SC_RETRY_MS;
+    if (g_sc_made || now - g_sc_fail_first < SC_GIVE_UP_MS) return;
+    if (rt_config()->player) {
+        wchar_t msg[1024], name[256];
+        MultiByteToWideChar(CP_UTF8, 0, c->props.deviceName, -1, name, 256);
+        _snwprintf(msg, 1024,
+                   L"The game cannot show its picture on %ls: Vulkan refused to create the window's swapchain "
+                   L"(error %d) for %.0f seconds.\n\n"
+                   L"On a PC with more than one GPU this happens when the monitor is connected to another GPU than "
+                   L"the one the game uses. Connect the monitor to %ls, or set gpu_index in mp4.ini to the GPU the "
+                   L"monitor is connected to (logs\\mp4.log lists them in its \"vk: gpu\" lines).",
+                   name, (int)r, (now - g_sc_fail_first) / 1000.0, name);
+        msg[1023] = 0;
+        MessageBoxW(NULL, msg, L"MP4 Recomp", MB_OK | MB_ICONERROR);
+    }
+    rt_fatal("gfx: no swapchain on %s after %u tries in %.0f s (vkCreateSwapchainKHR %d): on a PC with more than one "
+             "GPU, the monitor must be connected to the GPU the game uses (gpu_index in mp4.ini picks it)",
+             c->props.deviceName, g_sc_fails, (now - g_sc_fail_first) / 1000.0, (int)r);
+}
+
+// Returns 1 with a usable swapchain, 0 when the window has no area (minimised) or the swapchain could not be made (the
+// old one, if any, stays in g_sc). Called with g_pl held.
 static int create_swapchain(void) {
+    if (g_sc_fails && GetTickCount64() < g_sc_fail_next) return 0;   // failing: SC_RETRY_MS between tries
     flip_locked();   // the acquired image goes out before its swapchain is replaced
     VkCtx *c = vk_ctx();
     VkSurfaceCapabilitiesKHR caps;
@@ -620,11 +666,15 @@ static int create_swapchain(void) {
         .oldSwapchain = old};
     VkResult r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
     if (r != VK_SUCCESS) {
-        rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
         g_sc = old;
         vk_queue_unlock();
+        swapchain_failed(r, ext, sf.format);
         return 0;
     }
+    if (g_sc_fails)
+        rt_log("gfx: swapchain created after %u failed tries in %.1f s", g_sc_fails,
+               (GetTickCount64() - g_sc_fail_first) / 1000.0);
+    g_sc_fails = 0, g_sc_made = 1;
     for (uint32_t i = 0; i < g_sc_n; i++) {
         vkDestroySemaphore(c->device, g_render_done[i], NULL);
         if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
