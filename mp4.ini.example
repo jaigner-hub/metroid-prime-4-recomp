@@ -16,7 +16,8 @@
 # fullscreen = 0
 # Window size, WxH.
 # window_size = 1920x1080
-# Native 4K in docked mode requires output_res = 3840x2160 and render_scale = 100, then a restart.
+# Game resolution and render scale (docked mode, after restart): the game renders at render_scale percent of
+# output_res, up to 3840x2160 (21:9 sizes get the 16:9 picture at their height); game keeps the stock 1600x900.
 # output_res = 1920x1080
 # render_scale = game
 # Vulkan present mode: mailbox (the default), fifo (vsync) or immediate.

@@ -53,10 +53,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_PERF_LINE_FPS] = "%.0f fps",
     [UI_MENU_GRAPHICS] = "Picture",
     [UI_MENU_OUTPUT_RES] = "Game resolution",
-    [UI_MENU_OUTPUT_RES_DESC] = "For native 4K in docked mode, choose 3840 x 2160 and set 3D render scale to 100 %. "
-                                "Other combinations use the game's default resolution.",
+    [UI_MENU_OUTPUT_RES_DESC] = "The size the game renders for, with 3D render scale. 21:9 sizes render the game's 16:9 "
+                                "picture at their height. Applies after restart, in docked mode.",
     [UI_MENU_RENDER_SCALE] = "3D render scale",
-    [UI_MENU_RENDER_SCALE_DESC] = "Choose 100 % with 3840 x 2160 to render the 3D scene at native 4K after restart.",
+    [UI_MENU_RENDER_SCALE_DESC] = "Percent of the game resolution the game renders at, up to 3840 x 2160; the UI follows. "
+                                  "Game keeps its own 1600 x 900. Applies after restart.",
     [UI_MENU_RENDER_SCALE_GAME] = "Game (83 %)",
     [UI_MENU_ANISOTROPY] = "Anisotropic filtering",
     [UI_MENU_ANISOTROPY_DESC] = "Sharpens mipmapped world textures at shallow angles. Game uses the original texture filters.",
@@ -294,10 +295,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_PERF_LINE_FPS] = "%.0f к/с",
     [UI_MENU_GRAPHICS] = "Изображение",
     [UI_MENU_OUTPUT_RES] = "Разрешение игры",
-    [UI_MENU_OUTPUT_RES_DESC] = "Для нативного 4K в режиме док-станции выберите 3840 × 2160 и масштаб 3D-отрисовки 100 %. "
-                                "При других сочетаниях используется стандартное разрешение игры.",
+    [UI_MENU_OUTPUT_RES_DESC] = "Размер, для которого рисует игра, вместе с масштабом 3D-отрисовки. При 21:9 игра рисует "
+                                "свою картинку 16:9 по высоте экрана. Применяется после перезапуска, в режиме док-станции.",
     [UI_MENU_RENDER_SCALE] = "Масштаб 3D-отрисовки",
-    [UI_MENU_RENDER_SCALE_DESC] = "Выберите 100 % при 3840 × 2160, чтобы после перезапуска 3D-сцена рисовалась в нативном 4K.",
+    [UI_MENU_RENDER_SCALE_DESC] = "Доля разрешения игры, в которой она рисует, не больше 3840 × 2160; интерфейс тоже. "
+                                  "«Как в игре» оставляет 1600 × 900. Применяется после перезапуска.",
     [UI_MENU_RENDER_SCALE_GAME] = "Как в игре (83 %)",
     [UI_MENU_ANISOTROPY] = "Анизотропная фильтрация",
     [UI_MENU_ANISOTROPY_DESC] = "Повышает чёткость текстур мира под острым углом. Режим «Как в игре» сохраняет исходную фильтрацию.",
