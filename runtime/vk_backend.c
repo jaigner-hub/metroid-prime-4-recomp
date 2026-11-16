@@ -40,6 +40,10 @@ static SRWLOCK pl = SRWLOCK_INIT;
 static CONDITION_VARIABLE pcv = CONDITION_VARIABLE_INIT;   // job queued, job taken, job submitted
 static PresentJob job;
 static int pending, busy, present_thread;
+// Presents queued and presents whose blit was submitted, under pl. vk_present_drain waits for the count queued when it
+// was called: a wait for pending and busy both clear starved while the game kept the slot filled, its next present
+// queued during each blit, and held the game's movie thread in nvnTextureWriteTexels for 13 s (issue #25).
+static uint64_t p_queued, p_done;
 
 // Sleeps on a high-resolution timer to 1 ms before at, then yields until at: the timer alone wakes up to ~0.5 ms late.
 static void wait_until(HANDLE timer, uint64_t at) {
@@ -72,6 +76,7 @@ static DWORD WINAPI present_main(void *arg) {
                      (unsigned long long)f, (unsigned long long)j.value);
         AcquireSRWLockExclusive(&pl);
         busy = 0;
+        p_done++;
         WakeAllConditionVariable(&pcv);
         ReleaseSRWLockExclusive(&pl);
         uint64_t t0 = kern_now_ns();
@@ -96,7 +101,8 @@ static DWORD WINAPI present_main(void *arg) {
 void vk_present_drain(void) {
     uint64_t p0 = perf_begin();
     AcquireSRWLockExclusive(&pl);
-    while (pending || busy) SleepConditionVariableSRW(&pcv, &pl, INFINITE, 0);
+    uint64_t target = p_queued;   // the presents queued so far; later ones need not be waited for
+    while (p_done < target) SleepConditionVariableSRW(&pcv, &pl, INFINITE, 0);
     ReleaseSRWLockExclusive(&pl);
     perf_end(PERF_DRAIN, p0);
 }
@@ -138,6 +144,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     while (pending) SleepConditionVariableSRW(&pcv, &pl, INFINITE, 0);   // one present in waiting at most
     job = j;
     pending = 1;
+    p_queued++;
     WakeAllConditionVariable(&pcv);
     ReleaseSRWLockExclusive(&pl);
     if (rdoc_active()) { vk_present_drain(); rdoc_after_present(frame); }
@@ -163,6 +170,9 @@ static CONDITION_VARIABLE rcv = CONDITION_VARIABLE_INIT;   // item queued, item 
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
+// Items queued and items replayed, under rl: replay_drain waits for the count queued when it was called, not for an
+// empty queue, which other threads that keep queueing could postpone without end (as vk_present_drain, issue #25).
+static uint64_t r_items_queued, r_items_done;
 // Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
 static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr_twaits[DR_N], dr_tns[DR_N];
 // MP4_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
@@ -242,6 +252,7 @@ static DWORD WINAPI replay_main(void *arg) {
         AcquireSRWLockExclusive(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
         else r_presents_done++;
+        r_items_done++;
         r_busy = 0;
         WakeAllConditionVariable(&rcv);
     }
@@ -292,20 +303,23 @@ static uint64_t replay_enqueue(ReplayItem *it) {
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
+    r_items_queued++;
     WakeAllConditionVariable(&rcv);
     ReleaseSRWLockExclusive(&rl);
     return it->value;
 }
 
-// Returns once every queued item was replayed and submitted. Back-end entries only: the replay thread never calls them.
+// Returns once every item queued before the call was replayed and submitted. Back-end entries only: the replay thread
+// never calls them.
 static void replay_drain(int why) {
     if (!gfx_replay_async()) return;
     AcquireSRWLockExclusive(&rl);
     dr_calls[why]++, dr_tcalls[why]++;
-    if (rq_n || r_busy) {
+    uint64_t target = r_items_queued;   // the items queued so far; later ones need not be waited for
+    if (r_items_done < target) {
         uint64_t p0 = perf_begin();
         int away = core_away_unlocked();
-        while (rq_n || r_busy) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
+        while (r_items_done < target) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
         wait_counted(why, p0);
         core_back_unlocked(&away);
     }
